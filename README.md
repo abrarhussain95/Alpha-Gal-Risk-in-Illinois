@@ -13,12 +13,8 @@ using a Leroux CAR prior fit via the `CARBayes` R package, with posterior predic
 Hussain A, Mateus-Pinilla N, Smith RL. County-Level Risk Mapping of Alpha-Gal Syndrome Using a Bayesian Proxy Approach, Illinois, 2019–2022. [Under review]
 
 ## Data availability
-Tick abundance data: [link to your previously published paper's data repository]
+Tick abundance data: (https://doi.org/10.1016/j.ttbdis.2025.102533)
 Ehrlichiosis data: available from IDPH upon request; not redistributed here due to data use restrictions.
-
-## Repository structure
-- `R/` — analysis scripts (data joining, CAR models, sensitivity analyses, figures)
-- `output/` — generated figures and tables (not version-controlled raw outputs)
 
 ## Contact
 Abrar Hussain, University of Illinois Urbana-Champaign — abrarh2@illinois.edu
