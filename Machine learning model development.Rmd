@@ -1,0 +1,2902 @@
+---
+title: "Machine learning model development"
+author: "Abrar"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+##import prepared data
+```{r}
+library(sf)
+library(dplyr)
+
+data_dir <- "C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Alpha Gal Risk in Illinois/Data"
+
+dat <- readRDS(file.path(data_dir, "ALL_DATA_FINAL_sf.rds"))
+
+## Final predictors
+final_vars <- c(
+  "BIO2","BIO8","BIO9","BIO15","BIO18",
+  "Forest_pct","Wetland_pct","Deer_suitability"
+)
+
+## Initial checks
+cat("Counties:", nrow(dat), "\n")
+cat("Columns:", ncol(dat), "\n")
+cat("Missing outcome:", sum(is.na(dat$LS_prop)), "\n")
+cat("Missing predictors:",
+    sum(is.na(sf::st_drop_geometry(dat)[final_vars])), "\n")
+
+stopifnot(
+  nrow(dat) == 102,
+  !anyDuplicated(dat$COUNTY_NAM),
+  !anyNA(dat$LS_prop),
+  !anyNA(sf::st_drop_geometry(dat)[final_vars])
+)
+
+summary(dat$LS_prop)
+
+```
+
+
+## 5 geographically clustered folds
+```{r}
+## Spatial 5-fold cross-validation
+library(sf); library(dplyr); library(ggplot2)
+
+set.seed(123)
+
+## County representative points in projected coordinates
+pts <- dat %>%
+  sf::st_transform(5070) %>%
+  sf::st_point_on_surface()
+
+xy <- sf::st_coordinates(pts)
+
+## Create 5 geographic clusters
+km <- kmeans(xy, centers=5, nstart=100, iter.max=100)
+
+## Number folds approximately north-to-south
+fold_order <- data.frame(cluster=km$cluster, y=xy[,2]) %>%
+  group_by(cluster) %>%
+  summarise(mean_y=mean(y), .groups="drop") %>%
+  arrange(desc(mean_y)) %>%
+  mutate(spatial_fold=row_number())
+
+dat$spatial_fold <- fold_order$spatial_fold[
+  match(km$cluster, fold_order$cluster)
+]
+
+## Check fold balance and outcome distribution
+fold_summary <- dat %>%
+  sf::st_drop_geometry() %>%
+  group_by(spatial_fold) %>%
+  summarise(
+    Counties=n(),
+    Mean_LS_prop=mean(LS_prop),
+    Median_LS_prop=median(LS_prop),
+    Zero_counties=sum(LS_prop==0),
+    .groups="drop"
+  )
+
+print(fold_summary)
+
+## Map spatial folds
+fold_map <- ggplot(dat) +
+  geom_sf(aes(fill=factor(spatial_fold)),color="white",linewidth=0.25) +
+  scale_fill_viridis_d(name="Spatial fold") +
+  coord_sf(datum=NA,expand=TRUE) +
+  theme_void(base_size=14) +
+  theme(
+    legend.position="right",
+    legend.title=element_text(face="bold",size=12),
+    plot.margin=margin(12,12,12,12)
+  )
+
+fold_map
+
+fold_summary <- dat %>%
+  sf::st_drop_geometry() %>%
+  dplyr::group_by(spatial_fold) %>%
+  dplyr::summarise(
+    Counties = dplyr::n(),
+    Mean_LS_prop = mean(LS_prop),
+    Median_LS_prop = median(LS_prop),
+    Zero_counties = sum(LS_prop == 0),
+    .groups = "drop"
+  )
+
+print(fold_summary)
+
+## Save spatial fold map
+out_dir <- "C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Alpha Gal Risk in Illinois/Output"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+ggsave(
+  filename = file.path(out_dir, "spatial_5_fold_cross_validation_map.tiff"),
+  plot = fold_map,
+  device = "tiff",
+  width = 6,
+  height = 8,
+  units = "in",
+  dpi = 300,
+  compression = "lzw",
+  bg = "white"
+)
+```
+
+
+## Model setup
+```{r}
+## Machine-learning and beta-binomial setup
+library(glmnet); library(mgcv); library(ranger); library(xgboost)
+library(glmmTMB); library(dplyr); library(sf)
+
+set.seed(123)
+
+## Prepare model data
+model_dat <- dat %>%
+  sf::st_drop_geometry() %>%
+  dplyr::select(COUNTY_NAM, CO_FIPS, spatial_fold,
+                LS_tick, Total_tick, LS_prop, dplyr::all_of(final_vars))
+
+## GAM formula
+gam_formula <- as.formula(paste(
+  "LS_prop ~",
+  paste(sprintf("s(%s, k=4, bs='cr')", final_vars), collapse=" + ")
+))
+
+## Beta-binomial regression formula
+bb_formula <- as.formula(paste(
+  "cbind(LS_tick, Total_tick-LS_tick) ~",
+  paste(final_vars, collapse=" + ")
+))
+
+## Check outcome validity
+stopifnot(
+  all(model_dat$Total_tick > 0),
+  all(model_dat$LS_tick >= 0),
+  all(model_dat$LS_tick <= model_dat$Total_tick),
+  all(model_dat$LS_tick == floor(model_dat$LS_tick)),
+  all(model_dat$Total_tick == floor(model_dat$Total_tick))
+)
+
+cat("Zero counties:", sum(model_dat$LS_prop==0), "\n")
+cat("One counties:", sum(model_dat$LS_prop==1), "\n")
+summary(model_dat$Total_tick)
+
+## Preliminary binomial overdispersion check
+bin_fit <- glm(bb_formula, family=binomial(), data=model_dat)
+dispersion <- sum(residuals(bin_fit, type="pearson")^2) / df.residual(bin_fit)
+cat("Binomial dispersion:", round(dispersion,3), "\n")
+cat("Binomial convergence:", bin_fit$converged, "\n")
+
+## Storage for spatial out-of-fold predictions
+oof <- model_dat %>%
+  dplyr::select(COUNTY_NAM, CO_FIPS, spatial_fold,
+                LS_tick, Total_tick, LS_prop) %>%
+  mutate(
+    BetaBinomial = NA_real_,
+    ElasticNet = NA_real_,
+    GAM = NA_real_,
+    RandomForest = NA_real_,
+    XGBoost = NA_real_
+  )
+
+## Store tuning results
+tune_en <- list()
+tune_rf <- list()
+tune_xgb <- list()
+```
+
+
+## Fit all four models using the same spatial folds
+```{r model-fitting, warning=FALSE, message=FALSE}
+
+## Fit five models with spatial CV
+set.seed(123)
+
+total_steps <- 25; completed_steps <- 0
+pb <- txtProgressBar(min=0, max=total_steps, style=3)
+progress <- function(){completed_steps <<- completed_steps + 1; setTxtProgressBar(pb,completed_steps)}
+
+bb_diag <- list()
+
+for(f in 1:5){
+
+  train <- model_dat %>% dplyr::filter(spatial_fold != f)
+  test  <- model_dat %>% dplyr::filter(spatial_fold == f)
+  test_index <- which(model_dat$spatial_fold == f)
+
+  x_train <- as.matrix(train[,final_vars])
+  x_test  <- as.matrix(test[,final_vars])
+
+  ## Beta-binomial
+  train_bb <- train
+  test_bb <- test
+
+  # Standardize from training fold only
+  mu <- sapply(train[,final_vars],mean)
+  sdv <- sapply(train[,final_vars],sd)
+  stopifnot(all(sdv > 0))
+
+  train_bb[final_vars] <- lapply(final_vars,function(v) (train[[v]]-mu[v])/sdv[v])
+  test_bb[final_vars]  <- lapply(final_vars,function(v) (test[[v]]-mu[v])/sdv[v])
+
+  bb_fit <- glmmTMB::glmmTMB(
+    bb_formula,
+    data=train_bb,
+    family=glmmTMB::betabinomial(link="logit")
+  )
+
+  oof$BetaBinomial[test_index] <- as.numeric(
+    predict(bb_fit,newdata=test_bb,type="response")
+  )
+
+  bb_diag[[f]] <- data.frame(
+    Fold=f,
+    Convergence=bb_fit$fit$convergence,
+    Positive_definite_Hessian=bb_fit$sdr$pdHess
+  )
+
+  progress()
+
+  ## Elastic Net
+  y_train <- cbind(LS=train$LS_tick,Other=train$Total_tick-train$LS_tick)
+  inner_fold <- as.integer(factor(train$spatial_fold))
+  alpha_grid <- c(0,0.25,0.5,0.75,1)
+
+  en_cv <- lapply(alpha_grid,function(a) glmnet::cv.glmnet(
+    x=x_train,y=y_train,family="binomial",alpha=a,foldid=inner_fold,
+    type.measure="deviance",standardize=TRUE))
+
+  en_loss <- sapply(en_cv,function(z) min(z$cvm,na.rm=TRUE))
+  best_i <- which.min(en_loss)
+  best_alpha <- alpha_grid[best_i]
+  best_lambda <- en_cv[[best_i]]$lambda.min
+
+  en_fit <- glmnet::glmnet(
+    x=x_train,y=y_train,family="binomial",alpha=best_alpha,
+    lambda=best_lambda,standardize=TRUE
+  )
+
+  oof$ElasticNet[test_index] <- as.numeric(
+    predict(en_fit,newx=x_test,s=best_lambda,type="response")
+  )
+
+  tune_en[[f]] <- data.frame(
+    Fold=f,alpha=best_alpha,lambda=best_lambda,
+    inner_deviance=en_loss[best_i]
+  )
+
+  progress()
+
+  ## GAM
+  gam_fit <- mgcv::gam(
+    gam_formula,data=train,weights=train$Total_tick,
+    family=quasibinomial(link="logit"),
+    method="REML",select=TRUE
+  )
+
+  oof$GAM[test_index] <- as.numeric(
+    predict(gam_fit,newdata=test,type="response")
+  )
+
+  progress()
+
+  ## Random Forest
+  rf_grid <- expand.grid(
+    mtry=c(2,4,6,8),
+    min.node.size=c(3,5,10)
+  )
+
+  rf_score <- rep(NA_real_,nrow(rf_grid))
+
+  for(j in seq_len(nrow(rf_grid))){
+
+    inner_pred <- rep(NA_real_,nrow(train))
+
+    for(g in sort(unique(train$spatial_fold))){
+
+      it <- train %>% dplyr::filter(spatial_fold != g)
+      iv <- train %>% dplyr::filter(spatial_fold == g)
+      iv_index <- which(train$spatial_fold == g)
+      w <- it$Total_tick/mean(it$Total_tick)
+
+      rf_i <- ranger::ranger(
+        dependent.variable.name="LS_prop",
+        data=it[,c("LS_prop",final_vars)],
+        case.weights=w,
+        num.trees=500,
+        mtry=rf_grid$mtry[j],
+        min.node.size=rf_grid$min.node.size[j],
+        seed=123+f+j
+      )
+
+      inner_pred[iv_index] <- predict(
+        rf_i,data=iv[,final_vars]
+      )$predictions
+    }
+
+    rf_score[j] <- sqrt(mean((train$LS_prop-inner_pred)^2))
+  }
+
+  best_i <- which.min(rf_score)
+  best_mtry <- rf_grid$mtry[best_i]
+  best_node <- rf_grid$min.node.size[best_i]
+
+  rf_fit <- ranger::ranger(
+    dependent.variable.name="LS_prop",
+    data=train[,c("LS_prop",final_vars)],
+    case.weights=train$Total_tick/mean(train$Total_tick),
+    num.trees=1000,
+    mtry=best_mtry,
+    min.node.size=best_node,
+    seed=123+f
+  )
+
+  oof$RandomForest[test_index] <- predict(
+    rf_fit,data=test[,final_vars]
+  )$predictions
+
+  tune_rf[[f]] <- data.frame(
+    Fold=f,mtry=best_mtry,min_node_size=best_node,
+    inner_RMSE=rf_score[best_i]
+  )
+
+  progress()
+
+  ## XGBoost
+  xgb_grid <- expand.grid(
+    max_depth=c(1,2,3),
+    eta=c(0.03,0.10),
+    min_child_weight=c(1,5)
+  )
+
+  xgb_score <- rep(NA_real_,nrow(xgb_grid))
+  xgb_rounds <- rep(NA_integer_,nrow(xgb_grid))
+
+  for(j in seq_len(nrow(xgb_grid))){
+
+    inner_pred <- rep(NA_real_,nrow(train))
+    iterations <- c()
+
+    for(g in sort(unique(train$spatial_fold))){
+
+      it <- train %>% dplyr::filter(spatial_fold != g)
+      iv <- train %>% dplyr::filter(spatial_fold == g)
+      iv_index <- which(train$spatial_fold == g)
+
+      dtrain <- xgboost::xgb.DMatrix(
+        as.matrix(it[,final_vars]),
+        label=it$LS_prop,
+        weight=it$Total_tick/mean(it$Total_tick)
+      )
+
+      dvalid <- xgboost::xgb.DMatrix(
+        as.matrix(iv[,final_vars]),
+        label=iv$LS_prop
+      )
+
+      pars <- list(
+        objective="reg:squarederror",
+        eval_metric="rmse",
+        max_depth=xgb_grid$max_depth[j],
+        eta=xgb_grid$eta[j],
+        min_child_weight=xgb_grid$min_child_weight[j],
+        subsample=0.8,
+        colsample_bytree=0.8
+      )
+
+      fit_i <- xgboost::xgb.train(
+        params=pars,data=dtrain,nrounds=500,
+        evals=list(validation=dvalid),
+        early_stopping_rounds=30,
+        verbose=0
+      )
+
+      inner_pred[iv_index] <- pmax(
+        0,pmin(1,predict(fit_i,dvalid))
+      )
+
+      bi <- fit_i$best_iteration
+      if(is.null(bi) || length(bi)==0 || is.na(bi)) bi <- 500
+      iterations <- c(iterations,bi)
+    }
+
+    xgb_score[j] <- sqrt(mean((train$LS_prop-inner_pred)^2))
+    xgb_rounds[j] <- round(median(iterations))
+  }
+
+  best_i <- which.min(xgb_score)
+  best_depth <- xgb_grid$max_depth[best_i]
+  best_eta <- xgb_grid$eta[best_i]
+  best_child <- xgb_grid$min_child_weight[best_i]
+  best_rounds <- max(10,xgb_rounds[best_i])
+
+  dtrain <- xgboost::xgb.DMatrix(
+    x_train,
+    label=train$LS_prop,
+    weight=train$Total_tick/mean(train$Total_tick)
+  )
+
+  dtest <- xgboost::xgb.DMatrix(x_test)
+
+  xgb_fit <- xgboost::xgb.train(
+    params=list(
+      objective="reg:squarederror",
+      eval_metric="rmse",
+      max_depth=best_depth,
+      eta=best_eta,
+      min_child_weight=best_child,
+      subsample=0.8,
+      colsample_bytree=0.8
+    ),
+    data=dtrain,
+    nrounds=best_rounds,
+    verbose=0
+  )
+
+  oof$XGBoost[test_index] <- pmax(
+    0,pmin(1,predict(xgb_fit,dtest))
+  )
+
+  tune_xgb[[f]] <- data.frame(
+    Fold=f,max_depth=best_depth,eta=best_eta,
+    min_child_weight=best_child,
+    nrounds=best_rounds,
+    inner_RMSE=xgb_score[best_i]
+  )
+
+  progress()
+}
+
+close(pb)
+
+## Beta-binomial convergence checks
+bb_diagnostics <- dplyr::bind_rows(bb_diag)
+print(bb_diagnostics)
+
+cat("\nFive-model fitting complete: 100%\n")
+```
+
+
+
+## Check predictions & comparison of models
+```{r}
+## Check predictions and model-selection diagnostics
+library(dplyr); library(spdep)
+
+models <- c("BetaBinomial","ElasticNet","GAM","RandomForest","XGBoost")
+
+## Check complete OOF predictions
+print(colSums(is.na(oof[,models])))
+stopifnot(!anyNA(oof[,models]))
+print(summary(oof[,models]))
+
+## Overall predictive performance and calibration
+metric_fun <- function(obs,pred){
+  cal <- lm(obs ~ pred)
+  data.frame(
+    RMSE=sqrt(mean((obs-pred)^2)),
+    MAE=mean(abs(obs-pred)),
+    R2=1-sum((obs-pred)^2)/sum((obs-mean(obs))^2),
+    Spearman=cor(obs,pred,method="spearman"),
+    Calibration_intercept=unname(coef(cal)[1]),
+    Calibration_slope=unname(coef(cal)[2])
+  )
+}
+
+overall_performance <- bind_rows(lapply(models,function(m){
+  data.frame(Model=m,metric_fun(oof$LS_prop,oof[[m]]))
+}))
+
+## Performance within each spatial fold
+fold_performance <- bind_rows(lapply(models,function(m){
+  oof %>%
+    group_by(spatial_fold) %>%
+    summarise(
+      Model=m,
+      RMSE=sqrt(mean((LS_prop-.data[[m]])^2)),
+      MAE=mean(abs(LS_prop-.data[[m]])),
+      R2=1-sum((LS_prop-.data[[m]])^2)/sum((LS_prop-mean(LS_prop))^2),
+      Spearman=cor(LS_prop,.data[[m]],method="spearman"),
+      .groups="drop"
+    )
+}))
+
+## Fold-to-fold consistency
+fold_consistency <- fold_performance %>%
+  group_by(Model) %>%
+  summarise(
+    Fold_RMSE_SD=sd(RMSE),
+    Worst_fold_RMSE=max(RMSE),
+    Fold_MAE_SD=sd(MAE),
+    .groups="drop"
+  )
+
+## Moran's I of OOF residuals
+dat_moran <- dat[match(oof$CO_FIPS,dat$CO_FIPS),]
+stopifnot(all(dat_moran$CO_FIPS==oof$CO_FIPS))
+
+nb <- spdep::poly2nb(dat_moran,queen=TRUE)
+lw <- spdep::nb2listw(nb,style="W",zero.policy=TRUE)
+
+moran_results <- bind_rows(lapply(seq_along(models),function(i){
+  m <- models[i]
+  res <- oof$LS_prop-oof[[m]]
+  set.seed(123+i)
+  mc <- spdep::moran.mc(res,lw,nsim=999,alternative="greater",zero.policy=TRUE)
+
+  data.frame(
+    Model=m,
+    Moran_I=unname(mc$statistic),
+    Moran_p=mc$p.value
+  )
+}))
+
+## Final model-selection table
+model_selection <- overall_performance %>%
+  left_join(moran_results,by="Model") %>%
+  left_join(fold_consistency,by="Model") %>%
+  arrange(RMSE)
+
+print(model_selection)
+print(fold_performance)
+
+```
+
+
+## save outputs of model diagnostic for comaprsion 
+```{r}
+## Create one master model-selection CSV
+library(dplyr)
+
+models <- c("BetaBinomial","ElasticNet","GAM","RandomForest","XGBoost")
+
+## Fold-level diagnostics including calibration
+fold_diagnostics <- bind_rows(lapply(models,function(m){
+  bind_rows(lapply(sort(unique(oof$spatial_fold)),function(f){
+
+    d <- oof %>% filter(spatial_fold==f)
+    cal <- lm(d$LS_prop ~ d[[m]])
+
+    data.frame(
+      Model=m,
+      Level="Fold",
+      Fold=f,
+      RMSE=sqrt(mean((d$LS_prop-d[[m]])^2)),
+      MAE=mean(abs(d$LS_prop-d[[m]])),
+      R2=1-sum((d$LS_prop-d[[m]])^2)/
+           sum((d$LS_prop-mean(d$LS_prop))^2),
+      Spearman=cor(d$LS_prop,d[[m]],method="spearman"),
+      Calibration_intercept=unname(coef(cal)[1]),
+      Calibration_slope=unname(coef(cal)[2])
+    )
+  }))
+}))
+
+## Overall model-selection diagnostics
+overall_master <- model_selection %>%
+  mutate(Level="Overall",Fold=NA_integer_) %>%
+  select(
+    Model,Level,Fold,
+    RMSE,MAE,R2,Spearman,
+    Calibration_intercept,Calibration_slope,
+    Moran_I,Moran_p,
+    Fold_RMSE_SD,Worst_fold_RMSE,Fold_MAE_SD
+  )
+
+## Add model-level fields as NA for individual folds
+fold_master <- fold_diagnostics %>%
+  mutate(
+    Moran_I=NA_real_,
+    Moran_p=NA_real_,
+    Fold_RMSE_SD=NA_real_,
+    Worst_fold_RMSE=NA_real_,
+    Fold_MAE_SD=NA_real_
+  ) %>%
+  select(names(overall_master))
+
+## Final master table
+model_selection_all <- bind_rows(overall_master,fold_master) %>%
+  arrange(Model,desc(Level),Fold)
+
+print(model_selection_all)
+
+## Save
+out_dir <- "C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Alpha Gal Risk in Illinois/Output"
+dir.create(out_dir,recursive=TRUE,showWarnings=FALSE)
+
+write.csv(
+  model_selection_all,
+  file.path(out_dir,"ML_model_selection_all_diagnostics.csv"),
+  row.names=FALSE
+)
+
+cat("Saved:\n",
+    file.path(out_dir,"ML_model_selection_all_diagnostics.csv"),"\n")
+```
+
+## Addding spatila BYM2 componet to Beta binomial and two winner canidate model to see if taht improves
+## (Betabinomial is ben re-run to seee actually ho much bym2 improve in model other tah amchine learning)
+```{r}
+## Spatial BYM2 extensions of beta-binomial, RF and XGBoost
+library(INLA); library(spdep); library(dplyr)
+library(ranger); library(xgboost)
+
+set.seed(123)
+
+## County adjacency in exactly the model-data order
+dat_sp <- dat[match(model_dat$CO_FIPS, dat$CO_FIPS),]
+stopifnot(all(dat_sp$CO_FIPS == model_dat$CO_FIPS))
+
+nb <- spdep::poly2nb(dat_sp, queen=TRUE)
+graph_file <- tempfile(fileext=".graph")
+spdep::nb2INLA(graph_file, nb)
+g <- INLA::inla.read.graph(graph_file)
+
+## Add spatial-model OOF columns
+oof$BetaBinomial_BYM2 <- NA_real_
+oof$RandomForest_BYM2 <- NA_real_
+oof$XGBoost_BYM2 <- NA_real_
+
+## BYM2 priors and helper functions
+bym2_hyper <- list(
+  prec=list(prior="pc.prec",param=c(1,0.01)),
+  phi=list(prior="pc",param=c(0.5,0.5))
+)
+
+clip01 <- function(x,eps=1e-4) pmin(1-eps,pmax(eps,x))
+logit01 <- function(x) qlogis(clip01(x))
+
+get_hyper <- function(fit,pattern){
+  z <- grep(pattern,rownames(fit$summary.hyperpar),ignore.case=TRUE)
+  if(length(z)) fit$summary.hyperpar[z[1],"mean"] else NA_real_
+}
+
+spatial_diag <- list()
+
+for(f in 1:5){
+
+  train_idx <- which(model_dat$spatial_fold != f)
+  test_idx  <- which(model_dat$spatial_fold == f)
+
+  train <- model_dat[train_idx,]
+  test  <- model_dat[test_idx,]
+
+  ## Beta-binomial + BYM2
+  sp_dat <- model_dat
+  mu <- sapply(train[,final_vars],mean)
+  sdv <- sapply(train[,final_vars],sd)
+
+  for(v in final_vars)
+    sp_dat[[v]] <- (model_dat[[v]]-mu[v])/sdv[v]
+
+  sp_dat$y <- model_dat$LS_tick
+  sp_dat$y[test_idx] <- NA
+  sp_dat$sp_id <- seq_len(nrow(model_dat))
+
+  bb_bym2_formula <- as.formula(paste(
+    "y ~", paste(final_vars,collapse=" + "),
+    "+ f(sp_id,model='bym2',graph=g,scale.model=TRUE,constr=TRUE,hyper=bym2_hyper)"
+  ))
+
+  bb_sp <- INLA::inla(
+    bb_bym2_formula,
+    family="betabinomial",
+    Ntrials=model_dat$Total_tick,
+    data=sp_dat,
+    control.predictor=list(compute=TRUE,link=1),
+    verbose=FALSE
+  )
+
+  oof$BetaBinomial_BYM2[test_idx] <-
+    clip01(bb_sp$summary.fitted.values$mean[test_idx])
+
+  spatial_diag[[length(spatial_diag)+1]] <- data.frame(
+    Model="BetaBinomial_BYM2",Fold=f,
+    BYM2_phi=get_hyper(bb_sp,"Phi"),
+    BYM2_precision=get_hyper(bb_sp,"Precision"),
+    Overdispersion=get_hyper(bb_sp,"overdispersion"),
+    Base_slope=NA_real_
+  )
+
+  ## Random Forest: inner cross-fitted predictions for spatial calibration
+  rf_par <- tune_rf[[f]]
+  rf_train_pred <- rep(NA_real_,nrow(train))
+
+  for(gf in sort(unique(train$spatial_fold))){
+
+    it <- train %>% filter(spatial_fold != gf)
+    iv <- train %>% filter(spatial_fold == gf)
+    iv_idx <- which(train$spatial_fold == gf)
+
+    rf_i <- ranger::ranger(
+      dependent.variable.name="LS_prop",
+      data=it[,c("LS_prop",final_vars)],
+      case.weights=it$Total_tick/mean(it$Total_tick),
+      num.trees=1000,
+      mtry=rf_par$mtry,
+      min.node.size=rf_par$min_node_size,
+      seed=123+f+gf
+    )
+
+    rf_train_pred[iv_idx] <-
+      predict(rf_i,data=iv[,final_vars])$predictions
+  }
+
+  rf_base <- rep(NA_real_,nrow(model_dat))
+  rf_base[train_idx] <- rf_train_pred
+  rf_base[test_idx] <- oof$RandomForest[test_idx]
+
+  rf_sp_dat <- model_dat
+  rf_sp_dat$y <- model_dat$LS_tick
+  rf_sp_dat$y[test_idx] <- NA
+  rf_sp_dat$sp_id <- seq_len(nrow(model_dat))
+  rf_sp_dat$base_logit <- logit01(rf_base)
+
+  hybrid_formula <- y ~ base_logit +
+    f(sp_id,model="bym2",graph=g,scale.model=TRUE,
+      constr=TRUE,hyper=bym2_hyper)
+
+  rf_sp <- INLA::inla(
+    hybrid_formula,
+    family="betabinomial",
+    Ntrials=model_dat$Total_tick,
+    data=rf_sp_dat,
+    control.predictor=list(compute=TRUE,link=1),
+    verbose=FALSE
+  )
+
+  oof$RandomForest_BYM2[test_idx] <-
+    clip01(rf_sp$summary.fitted.values$mean[test_idx])
+
+  spatial_diag[[length(spatial_diag)+1]] <- data.frame(
+    Model="RandomForest_BYM2",Fold=f,
+    BYM2_phi=get_hyper(rf_sp,"Phi"),
+    BYM2_precision=get_hyper(rf_sp,"Precision"),
+    Overdispersion=get_hyper(rf_sp,"overdispersion"),
+    Base_slope=rf_sp$summary.fixed["base_logit","mean"]
+  )
+
+  ## XGBoost: inner cross-fitted predictions for spatial calibration
+  xgb_par <- tune_xgb[[f]]
+  xgb_train_pred <- rep(NA_real_,nrow(train))
+
+  for(gf in sort(unique(train$spatial_fold))){
+
+    it <- train %>% filter(spatial_fold != gf)
+    iv <- train %>% filter(spatial_fold == gf)
+    iv_idx <- which(train$spatial_fold == gf)
+
+    d_it <- xgboost::xgb.DMatrix(
+      as.matrix(it[,final_vars]),
+      label=it$LS_prop,
+      weight=it$Total_tick/mean(it$Total_tick)
+    )
+
+    d_iv <- xgboost::xgb.DMatrix(as.matrix(iv[,final_vars]))
+
+    xgb_i <- xgboost::xgb.train(
+      params=list(
+        objective="reg:squarederror",
+        eval_metric="rmse",
+        max_depth=xgb_par$max_depth,
+        eta=xgb_par$eta,
+        min_child_weight=xgb_par$min_child_weight,
+        subsample=0.8,
+        colsample_bytree=0.8
+      ),
+      data=d_it,
+      nrounds=xgb_par$nrounds,
+      verbose=0
+    )
+
+    xgb_train_pred[iv_idx] <-
+      clip01(predict(xgb_i,d_iv))
+  }
+
+  xgb_base <- rep(NA_real_,nrow(model_dat))
+  xgb_base[train_idx] <- xgb_train_pred
+  xgb_base[test_idx] <- oof$XGBoost[test_idx]
+
+  xgb_sp_dat <- model_dat
+  xgb_sp_dat$y <- model_dat$LS_tick
+  xgb_sp_dat$y[test_idx] <- NA
+  xgb_sp_dat$sp_id <- seq_len(nrow(model_dat))
+  xgb_sp_dat$base_logit <- logit01(xgb_base)
+
+  xgb_sp <- INLA::inla(
+    hybrid_formula,
+    family="betabinomial",
+    Ntrials=model_dat$Total_tick,
+    data=xgb_sp_dat,
+    control.predictor=list(compute=TRUE,link=1),
+    verbose=FALSE
+  )
+
+  oof$XGBoost_BYM2[test_idx] <-
+    clip01(xgb_sp$summary.fitted.values$mean[test_idx])
+
+  spatial_diag[[length(spatial_diag)+1]] <- data.frame(
+    Model="XGBoost_BYM2",Fold=f,
+    BYM2_phi=get_hyper(xgb_sp,"Phi"),
+    BYM2_precision=get_hyper(xgb_sp,"Precision"),
+    Overdispersion=get_hyper(xgb_sp,"overdispersion"),
+    Base_slope=xgb_sp$summary.fixed["base_logit","mean"]
+  )
+
+  cat("Spatial fold",f,"complete\n")
+}
+
+spatial_diagnostics <- bind_rows(spatial_diag)
+
+## Check spatial OOF predictions
+spatial_models <- c(
+  "BetaBinomial_BYM2",
+  "RandomForest_BYM2",
+  "XGBoost_BYM2"
+)
+
+print(colSums(is.na(oof[,spatial_models])))
+print(spatial_diagnostics)
+
+stopifnot(!anyNA(oof[,spatial_models]))
+
+```
+
+
+## SAVE OUTPUTS again including spatial BYM2 MODLES
+```{r}
+## Complete diagnostics for all 8 models + BYM2 diagnostics in one CSV
+library(dplyr)
+library(spdep)
+
+## Eight models
+models8 <- c(
+  "BetaBinomial",
+  "ElasticNet",
+  "GAM",
+  "RandomForest",
+  "XGBoost",
+  "BetaBinomial_BYM2",
+  "RandomForest_BYM2",
+  "XGBoost_BYM2"
+)
+
+## Check all OOF predictions exist
+print(colSums(is.na(oof[,models8])))
+stopifnot(!anyNA(oof[,models8]))
+
+## Overall predictive performance and calibration
+overall_8 <- bind_rows(lapply(models8,function(m){
+
+  cal <- lm(oof$LS_prop ~ oof[[m]])
+
+  data.frame(
+    Model=m,
+    Level="Overall",
+    Fold=NA_integer_,
+    RMSE=sqrt(mean((oof$LS_prop-oof[[m]])^2)),
+    MAE=mean(abs(oof$LS_prop-oof[[m]])),
+    R2=1-sum((oof$LS_prop-oof[[m]])^2)/
+         sum((oof$LS_prop-mean(oof$LS_prop))^2),
+    Spearman=cor(oof$LS_prop,oof[[m]],method="spearman"),
+    Calibration_intercept=unname(coef(cal)[1]),
+    Calibration_slope=unname(coef(cal)[2])
+  )
+}))
+
+## Fold-level predictive performance and calibration
+fold_8 <- bind_rows(lapply(models8,function(m){
+
+  bind_rows(lapply(sort(unique(oof$spatial_fold)),function(f){
+
+    d <- oof %>% filter(spatial_fold==f)
+    cal <- lm(d$LS_prop ~ d[[m]])
+
+    data.frame(
+      Model=m,
+      Level="Fold",
+      Fold=f,
+      RMSE=sqrt(mean((d$LS_prop-d[[m]])^2)),
+      MAE=mean(abs(d$LS_prop-d[[m]])),
+      R2=1-sum((d$LS_prop-d[[m]])^2)/
+           sum((d$LS_prop-mean(d$LS_prop))^2),
+      Spearman=cor(d$LS_prop,d[[m]],method="spearman"),
+      Calibration_intercept=unname(coef(cal)[1]),
+      Calibration_slope=unname(coef(cal)[2])
+    )
+  }))
+}))
+
+## Fold-to-fold consistency
+fold_consistency_8 <- fold_8 %>%
+  group_by(Model) %>%
+  summarise(
+    Fold_RMSE_SD=sd(RMSE),
+    Worst_fold_RMSE=max(RMSE),
+    Fold_MAE_SD=sd(MAE),
+    .groups="drop"
+  )
+
+## Moran's I of OOF residuals
+dat_moran <- dat[match(oof$CO_FIPS,dat$CO_FIPS),]
+stopifnot(all(dat_moran$CO_FIPS==oof$CO_FIPS))
+
+nb_moran <- spdep::poly2nb(dat_moran,queen=TRUE)
+lw_moran <- spdep::nb2listw(nb_moran,style="W",zero.policy=TRUE)
+
+moran_8 <- bind_rows(lapply(seq_along(models8),function(i){
+
+  m <- models8[i]
+  res <- oof$LS_prop-oof[[m]]
+
+  set.seed(123+i)
+
+  mc <- spdep::moran.mc(
+    res,lw_moran,
+    nsim=999,
+    alternative="greater",
+    zero.policy=TRUE
+  )
+
+  data.frame(
+    Model=m,
+    Moran_I=unname(mc$statistic),
+    Moran_p=mc$p.value
+  )
+}))
+
+## Add overall diagnostics to overall rows
+overall_8 <- overall_8 %>%
+  left_join(moran_8,by="Model") %>%
+  left_join(fold_consistency_8,by="Model")
+
+## Add empty overall-only fields to fold rows
+fold_8 <- fold_8 %>%
+  mutate(
+    Moran_I=NA_real_,
+    Moran_p=NA_real_,
+    Fold_RMSE_SD=NA_real_,
+    Worst_fold_RMSE=NA_real_,
+    Fold_MAE_SD=NA_real_
+  )
+
+## Combine all 8 models
+model_selection_8 <- bind_rows(overall_8,fold_8)
+
+## BYM2 diagnostics for each spatial fold
+bym2_fold_diag <- spatial_diagnostics %>%
+  select(
+    Model,Fold,
+    BYM2_phi,
+    BYM2_precision,
+    Overdispersion,
+    Base_slope
+  )
+
+## Mean BYM2 diagnostics across outer folds for overall rows
+bym2_overall_diag <- spatial_diagnostics %>%
+  group_by(Model) %>%
+  summarise(
+    BYM2_phi=mean(BYM2_phi,na.rm=TRUE),
+    BYM2_precision=mean(BYM2_precision,na.rm=TRUE),
+    Overdispersion=mean(Overdispersion,na.rm=TRUE),
+    Base_slope=if(all(is.na(Base_slope))) NA_real_ else mean(Base_slope,na.rm=TRUE),
+    .groups="drop"
+  )
+
+## Add BYM2 diagnostics to fold rows
+model_selection_master <- model_selection_8 %>%
+  left_join(
+    bym2_fold_diag,
+    by=c("Model","Fold")
+  )
+
+## Fill BYM2 overall rows with mean diagnostics across folds
+for(i in seq_len(nrow(bym2_overall_diag))){
+
+  m <- bym2_overall_diag$Model[i]
+  idx <- model_selection_master$Model==m &
+         model_selection_master$Level=="Overall"
+
+  model_selection_master$BYM2_phi[idx] <-
+    bym2_overall_diag$BYM2_phi[i]
+
+  model_selection_master$BYM2_precision[idx] <-
+    bym2_overall_diag$BYM2_precision[i]
+
+  model_selection_master$Overdispersion[idx] <-
+    bym2_overall_diag$Overdispersion[i]
+
+  model_selection_master$Base_slope[idx] <-
+    bym2_overall_diag$Base_slope[i]
+}
+
+## Arrange models and rows
+model_selection_master$Model <- factor(
+  model_selection_master$Model,
+  levels=models8
+)
+
+model_selection_master <- model_selection_master %>%
+  mutate(Level=factor(Level,levels=c("Overall","Fold"))) %>%
+  arrange(Model,Level,Fold) %>%
+  mutate(
+    Model=as.character(Model),
+    Level=as.character(Level)
+  )
+
+## Print final table
+print(model_selection_master)
+
+## Save ONE master CSV
+out_dir <- "C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Alpha Gal Risk in Illinois/Output"
+dir.create(out_dir,recursive=TRUE,showWarnings=FALSE)
+
+write.csv(
+  model_selection_master,
+  file.path(out_dir,"ML_8model_complete_diagnostics.csv"),
+  row.names=FALSE
+)
+
+cat(
+  "Saved:\n",
+  file.path(out_dir,"ML_8model_complete_diagnostics.csv"),
+  "\n"
+)
+
+```
+
+
+
+##Final RF and XGBoost models (non spatial) using all counties and ploting feature importance ranking
+```{r model-fitting, warning=FALSE, message=FALSE}
+## Final RF and XGBoost models using all counties
+
+## Combine spatial-CV tuning results
+rf_tune <- dplyr::bind_rows(tune_rf)
+xgb_tune <- dplyr::bind_rows(tune_xgb)
+
+## Select most consistently chosen RF parameters
+rf_final_par <- rf_tune %>%
+  dplyr::group_by(mtry, min_node_size) %>%
+  dplyr::summarise(N=dplyr::n(), Mean_RMSE=mean(inner_RMSE), .groups="drop") %>%
+  dplyr::arrange(desc(N), Mean_RMSE) %>%
+  dplyr::slice(1)
+
+## Select most consistently chosen XGBoost parameters
+xgb_final_par <- xgb_tune %>%
+  dplyr::group_by(max_depth, eta, min_child_weight) %>%
+  dplyr::summarise(N=dplyr::n(), Mean_RMSE=mean(inner_RMSE),
+                   nrounds=round(median(nrounds)), .groups="drop") %>%
+  dplyr::arrange(desc(N), Mean_RMSE) %>%
+  dplyr::slice(1)
+
+print(rf_final_par)
+print(xgb_final_par)
+
+## Final Random Forest
+rf_final <- ranger::ranger(
+  dependent.variable.name="LS_prop",
+  data=model_dat[,c("LS_prop",final_vars)],
+  case.weights=model_dat$Total_tick/mean(model_dat$Total_tick),
+  num.trees=1000, mtry=rf_final_par$mtry,
+  min.node.size=rf_final_par$min_node_size,
+  importance="permutation", seed=123
+)
+
+## Final XGBoost
+x_all <- as.matrix(model_dat[,final_vars])
+d_all <- xgboost::xgb.DMatrix(x_all, label=model_dat$LS_prop,
+                              weight=model_dat$Total_tick/mean(model_dat$Total_tick))
+
+xgb_final <- xgboost::xgb.train(
+  params=list(objective="reg:squarederror", eval_metric="rmse",
+              max_depth=xgb_final_par$max_depth, eta=xgb_final_par$eta,
+              min_child_weight=xgb_final_par$min_child_weight,
+              subsample=0.8, colsample_bytree=0.8),
+  data=d_all, nrounds=xgb_final_par$nrounds, verbose=0
+)
+
+cat("\nFinal RF and XGBoost models fitted successfully.\n")
+
+
+
+
+
+## Variable importance
+
+## Random Forest permutation importance
+rf_imp <- data.frame(
+  Predictor=names(rf_final$variable.importance),
+  Importance=as.numeric(rf_final$variable.importance)
+) %>% dplyr::arrange(desc(Importance))
+
+## XGBoost gain importance
+xgb_imp <- xgboost::xgb.importance(model=xgb_final) %>%
+  as.data.frame() %>%
+  dplyr::transmute(Predictor=Feature, Importance=Gain) %>%
+  dplyr::arrange(desc(Importance))
+
+cat("\nRandom Forest importance:\n"); print(rf_imp)
+cat("\nXGBoost importance:\n"); print(xgb_imp)
+
+
+
+
+## Compare variable importance
+library(ggplot2); library(dplyr)
+
+labels <- c(BIO2="Mean diurnal range", BIO8="Temperature of wettest quarter",
+            BIO9="Temperature of driest quarter", BIO15="Precipitation seasonality",
+            BIO18="Precipitation of warmest quarter", Forest_pct="Forest cover",
+            Wetland_pct="Wetland cover", Deer_suitability="Deer suitability")
+
+## Variable importance plot sorted within each model
+library(tidytext)
+
+imp_plot_dat <- bind_rows(
+  rf_imp %>% mutate(Model="Random Forest"),
+  xgb_imp %>% mutate(Model="XGBoost")
+) %>%
+  group_by(Model) %>%
+  mutate(Relative_importance=100*Importance/max(Importance),
+         Predictor_label=labels[Predictor],
+         Predictor_sort=tidytext::reorder_within(Predictor_label, Relative_importance, Model)) %>%
+  ungroup()
+
+p_imp <- ggplot(imp_plot_dat, aes(x=Relative_importance, y=Predictor_sort)) +
+  geom_col() +
+  facet_wrap(~Model, scales="free_y") +
+  tidytext::scale_y_reordered() +
+  labs(x="Relative variable importance (%)", y=NULL) +
+  theme_classic(base_size=12) +
+  theme(
+    axis.title.x=element_text(face="bold", size=12),
+    axis.title.y=element_text(face="bold", size=12),
+    strip.text=element_text(face="bold", size=12)
+  )
+
+p_imp
+
+## Save variable importance figure
+out_dir <- "C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Alpha Gal Risk in Illinois/Output"
+
+ggsave(file.path(out_dir,"RF_XGBoost_variable_importance.tiff"),
+       p_imp, width=9, height=5.5, units="in", dpi=300,
+       compression="lzw", bg="white")
+
+```
+
+
+## ALE plots   [ALE (Accumulated Local Effects) = What happens to predicted lone-star proportion as a predictor changes?]
+```{r}
+library(iml)
+
+## ALE effects for top predictors
+library(iml); library(ggplot2); library(dplyr)
+
+X <- model_dat[,final_vars]; y <- model_dat$LS_prop
+top_vars <- c("BIO2","BIO9","BIO8","Deer_suitability")
+
+rf_pred <- iml::Predictor$new(
+  model=rf_final, data=X, y=y,
+  predict.function=function(model,newdata) predict(model,data=newdata)$predictions
+)
+
+xgb_pred <- iml::Predictor$new(
+  model=xgb_final, data=X, y=y,
+  predict.function=function(model,newdata) predict(model,as.matrix(newdata))
+)
+
+get_ale <- function(pred,v,model){
+  a <- iml::FeatureEffect$new(pred,feature=v,method="ale",grid.size=20)$results
+  data.frame(Model=model,Predictor=v,X=a[[v]],ALE=a$.value)
+}
+
+ale_dat <- dplyr::bind_rows(
+  lapply(top_vars,function(v) get_ale(rf_pred,v,"Random Forest")),
+  lapply(top_vars,function(v) get_ale(xgb_pred,v,"XGBoost"))
+)
+
+ale_dat$Predictor <- factor(
+  ale_dat$Predictor,
+  levels=top_vars,
+  labels=c("Mean diurnal range","Temperature of driest quarter",
+           "Temperature of wettest quarter","Deer suitability")
+)
+
+
+## Compact ALE: 4 panels, both models together
+library(ggplot2)
+
+p_ale <- ggplot(
+  ale_dat,
+  aes(x = X, y = ALE, color = Model, linetype = Model)
+) +
+  geom_hline(yintercept = 0, linetype = "dashed",
+             color = "grey60", linewidth = 0.4) +
+  geom_line(linewidth = 0.9) +
+  facet_wrap(~Predictor, scales = "free_x", ncol = 2) +
+  scale_color_manual(values = c(
+    "Random Forest" = "#2171A5",
+    "XGBoost" = "#D95F02"
+  )) +
+  scale_linetype_manual(values = c(
+    "Random Forest" = "solid",
+    "XGBoost" = "longdash"
+  )) +
+  labs(
+    x = "Predictor value",
+    y = "ALE effect on predicted tick proportion",
+    color = NULL,
+    linetype = NULL
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+  axis.title.x = element_text(face = "bold", size = 16),
+  axis.title.y = element_text(face = "bold", size = 16),
+  axis.text.x  = element_text(color = "black", size = 13),
+  axis.text.y  = element_text(color = "black", size = 13),
+
+  strip.text = element_text(face = "bold", size = 16),
+
+  legend.position = "bottom",
+  legend.text = element_text(face = "bold", size = 14),
+  legend.box = "horizontal"
+)
+
+p_ale
+
+## Save shorter figure
+ggsave(
+  file.path(out_dir, "RF_XGBoost_ALE_compact.tiff"),
+  p_ale,
+  width = 13.5,
+  height = 6.5,
+  units = "in",
+  dpi = 300,
+  compression = "lzw",
+  bg = "white"
+)
+```
+
+
+## SHAP for XGBoost  [SHAP (SHapley Additive exPlanations.): How much did each variable push each county's prediction up or down?]
+```{r}
+
+## XGBoost SHAP
+library(shapviz); library(ggplot2)
+
+X_shap <- model_dat[, final_vars]
+sv_xgb <- shapviz::shapviz(xgb_final, X_pred=as.matrix(X_shap), X=X_shap)
+
+## Clear predictor labels
+shap_labels <- c(
+  BIO2="Mean diurnal range",
+  BIO8="Temperature of wettest quarter",
+  BIO9="Temperature of driest quarter",
+  BIO15="Precipitation seasonality",
+  BIO18="Precipitation of warmest quarter",
+  Forest_pct="Forest cover",
+  Wetland_pct="Wetland cover",
+  Deer_suitability="Deer suitability"
+)
+
+## SHAP beeswarm
+p_shap_xgb <- shapviz::sv_importance(sv_xgb, kind="beeswarm", max_display=8) +
+  scale_y_discrete(labels=shap_labels) +
+  scale_color_viridis_c(option="plasma", name="Feature value") +
+  labs(x="SHAP value", y=NULL) +
+  theme_gray(base_size=12) +
+  theme(
+    panel.background=element_rect(fill="grey94", color=NA),
+    panel.grid=element_blank(),
+    axis.title.x=element_text(face="bold", size=13, color="black"),
+    axis.text.x=element_text(size=11, color="black"),
+    axis.text.y=element_text(size=11, face="bold", color="black"),
+    legend.title=element_text(face="bold", size=12),
+    legend.text=element_text(size=11),
+    plot.margin=margin(8,8,8,4)
+  )
+
+p_shap_xgb
+
+## Save XGBoost SHAP
+out_dir <- "C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Alpha Gal Risk in Illinois/Output"
+
+ggsave(
+  file.path(out_dir,"XGBoost_SHAP_beeswarm.tiff"),
+  p_shap_xgb,
+  width=8.5, height=6.5, units="in",
+  dpi=300, compression="lzw", bg="white"
+)
+
+
+## XGBoost SHAP importance bar plot
+p_shap_bar <- shapviz::sv_importance(sv_xgb, kind="bar", max_display=8) +
+  scale_y_discrete(labels=shap_labels) +
+  labs(x="Mean absolute SHAP value", y=NULL) +
+  theme_gray(base_size=12) +
+  theme(
+    panel.background=element_rect(fill="grey94", color=NA),
+    panel.grid=element_blank(),
+    axis.title.x=element_text(face="bold", size=13, color="black"),
+    axis.text.x=element_text(size=11, color="black"),
+    axis.text.y=element_text(size=11, face="bold", color="black"),
+    plot.margin=margin(8,8,8,4)
+  )
+
+p_shap_bar
+
+## Save SHAP importance bar plot
+out_dir <- "C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Alpha Gal Risk in Illinois/Output"
+
+ggsave(
+  file.path(out_dir,"XGBoost_SHAP_importance_bar.tiff"),
+  p_shap_bar,
+  width=7.5, height=5.5, units="in",
+  dpi=300, compression="lzw", bg="white"
+)
+```
+
+
+
+## SHAP for Random Forest model
+```{r}
+
+## Random Forest SHAP
+library(kernelshap); library(shapviz); library(ranger)
+
+X_shap <- as.data.frame(model_dat[,final_vars])
+
+## Explicit Ranger prediction function
+rf_predict <- getS3method("predict","ranger", envir=asNamespace("ranger"))
+rf_pred_fun <- function(object,X,...) rf_predict(object,data=X,...)$predictions
+
+## Quick prediction check
+head(rf_pred_fun(rf_final,X_shap))
+
+## Exact permutation SHAP
+set.seed(123)
+rf_shap <- kernelshap::permshap(
+  rf_final, X=X_shap, bg_X=X_shap,
+  pred_fun=rf_pred_fun, seed=123
+)
+
+sv_rf <- shapviz::shapviz(rf_shap)
+
+
+
+
+```
+
+
+## Plotting SHAP for Random Forest model
+```{r}
+## Random Forest SHAP beeswarm
+p_shap_rf <- shapviz::sv_importance(sv_rf, kind="beeswarm", max_display=8) +
+  scale_y_discrete(labels=shap_labels) +
+  scale_color_viridis_c(option="plasma", name="Feature value") +
+  labs(x="SHAP value", y=NULL) +
+  theme_gray(base_size=12) +
+  theme(panel.background=element_rect(fill="grey94",color=NA), panel.grid=element_blank(),
+        axis.title.x=element_text(face="bold",size=13,color="black"),
+        axis.text.x=element_text(size=11,color="black"),
+        axis.text.y=element_text(size=11,face="bold",color="black"),
+        legend.title=element_text(face="bold",size=12),
+        legend.text=element_text(size=11))
+
+p_shap_rf
+
+## Random Forest SHAP importance bar
+p_shap_rf_bar <- shapviz::sv_importance(sv_rf, kind="bar", max_display=8) +
+  scale_y_discrete(labels=shap_labels) +
+  labs(x="Mean absolute SHAP value", y=NULL) +
+  theme_gray(base_size=12) +
+  theme(panel.background=element_rect(fill="grey94",color=NA), panel.grid=element_blank(),
+        axis.title.x=element_text(face="bold",size=13,color="black"),
+        axis.text.x=element_text(size=11,color="black"),
+        axis.text.y=element_text(size=11,face="bold",color="black"))
+
+p_shap_rf_bar
+
+## Save Random Forest SHAP plots
+out_dir <- "C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Alpha Gal Risk in Illinois/Output"
+dir.create(out_dir, recursive=TRUE, showWarnings=FALSE)
+
+ggsave(file.path(out_dir,"RandomForest_SHAP_beeswarm.tiff"),
+       p_shap_rf, width=8.5, height=6.5, units="in",
+       dpi=300, compression="lzw", bg="white")
+
+ggsave(file.path(out_dir,"RandomForest_SHAP_importance_bar.tiff"),
+       p_shap_rf_bar, width=7.5, height=5.5, units="in",
+       dpi=300, compression="lzw", bg="white")
+```
+## Combine RF and XGBoost SHAP beeswarm plots with shared y-axis and one legend
+```{r}
+library(shapviz)
+library(ggplot2)
+library(patchwork)
+
+## Same feature labels
+shap_labels <- c(
+  BIO2 = "Mean diurnal range",
+  BIO8 = "Temperature of wettest quarter",
+  BIO9 = "Temperature of driest quarter",
+  BIO15 = "Precipitation seasonality",
+  BIO18 = "Precipitation of warmest quarter",
+  Forest_pct = "Forest cover",
+  Wetland_pct = "Wetland cover",
+  Deer_suitability = "Deer suitability"
+)
+
+## Common feature order
+feature_order <- c(
+  "BIO2", "BIO8", "BIO9", "BIO15",
+  "BIO18", "Forest_pct", "Wetland_pct", "Deer_suitability"
+)
+
+## LEFT PANEL = Random Forest
+## Put y-axis labels on the RIGHT side so they appear between both plots
+p_shap_rf_comb <- shapviz::sv_importance(sv_rf, kind = "beeswarm", max_display = 8) +
+  scale_y_discrete(
+    limits = rev(feature_order),
+    labels = shap_labels,
+    position = "right"
+  ) +
+  scale_color_viridis_c(option = "plasma", name = "Feature value") +
+  labs(
+    title = "Random Forest",
+    x = "SHAP value",
+    y = NULL
+  ) +
+  theme_gray(base_size = 12) +
+  theme(
+    panel.background = element_rect(fill = "grey94", color = NA),
+    panel.grid = element_blank(),
+    axis.title.x = element_text(face = "bold", size = 13, color = "black"),
+    axis.text.x = element_text(size = 11, color = "black"),
+
+    ## hide left side y-axis completely
+    axis.text.y.left = element_blank(),
+    axis.ticks.y.left = element_blank(),
+    axis.line.y.left = element_blank(),
+
+    ## show right side y-axis clearly
+    axis.text.y.right = element_text(size = 11, face = "bold", color = "black", hjust = 0.5),
+    axis.ticks.y.right = element_line(color = "black"),
+    axis.line.y.right = element_line(color = "black", linewidth = 0.6),
+
+    legend.title = element_text(face = "bold", size = 12),
+    legend.text = element_text(size = 11),
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.margin = margin(8, 12, 8, 8)
+  )
+
+## RIGHT PANEL = XGBoost
+p_shap_xgb_comb <- shapviz::sv_importance(sv_xgb, kind = "beeswarm", max_display = 8) +
+  scale_y_discrete(
+    limits = rev(feature_order),
+    labels = shap_labels
+  ) +
+  scale_color_viridis_c(option = "plasma", name = "Feature value") +
+  labs(
+    title = "XGBoost",
+    x = "SHAP value",
+    y = NULL
+  ) +
+  theme_gray(base_size = 12) +
+  theme(
+    panel.background = element_rect(fill = "grey94", color = NA),
+    panel.grid = element_blank(),
+    axis.title.x = element_text(face = "bold", size = 13, color = "black"),
+    axis.text.x = element_text(size = 11, color = "black"),
+
+    ## remove y-axis on right plot
+    ## Hide feature names but retain the left y-axis
+    axis.text.y.left = element_blank(),
+    
+    ## Show vertical y-axis line and small protruding ticks
+    axis.line.y.left = element_line(color = "black", linewidth = 0.6),
+    axis.ticks.y.left = element_line(color = "black", linewidth = 0.6),
+    axis.ticks.length.y.left = grid::unit(4, "pt"),
+
+    legend.title = element_text(face = "bold", size = 12),
+    legend.text = element_text(size = 11),
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.margin = margin(8, 8, 8, 12)
+  )
+
+## Combine
+p_shap_both <- p_shap_rf_comb + p_shap_xgb_comb +
+  plot_layout(ncol = 2, guides = "collect", widths = c(1, 1)) &
+  theme(
+    legend.position = "right"
+  )
+
+p_shap_both
+
+## Save
+out_dir <- "C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Alpha Gal Risk in Illinois/Output"
+
+ggsave(
+  file.path(out_dir, "RF_XGBoost_SHAP_beeswarm_combined_centerlabels.tiff"),
+  p_shap_both,
+  width = 13.5, height = 6.5, units = "in",
+  dpi = 300, compression = "lzw", bg = "white"
+)
+```
+
+
+##Maps of Random Forest and XGBoost OOF predictions
+```{r}
+## Map out-of-fold predictions
+library(sf); library(patchwork)
+
+map_oof <- dat %>%
+  dplyr::left_join(
+    oof %>% dplyr::select(CO_FIPS, RandomForest, XGBoost),
+    by="CO_FIPS"
+  )
+
+
+## Map
+p_rf_map <- ggplot(map_oof) +
+  geom_sf(aes(fill=RandomForest),color="white",linewidth=0.2) +
+  scale_fill_viridis_c(option="plasma",limits=c(0,1),name="Predicted\nproportion") +
+  ggtitle("Random Forest") +
+  theme_void(base_size=12) +
+  theme(plot.title=element_text(face="bold",hjust=0.5))
+
+p_xgb_map <- ggplot(map_oof) +
+  geom_sf(aes(fill=XGBoost),color="white",linewidth=0.2) +
+  scale_fill_viridis_c(option="plasma",limits=c(0,1),name="Predicted\nproportion") +
+  ggtitle("XGBoost") +
+  theme_void(base_size=12) +
+  theme(plot.title=element_text(face="bold",hjust=0.5))
+
+p_oof_map <- (p_rf_map | p_xgb_map) +
+  plot_layout(guides="collect") &
+  theme(legend.position="right",
+        legend.title=element_text(face="bold",size=11))
+
+p_oof_map
+
+## Save
+ggsave(file.path(out_dir,"RF_XGBoost_OOF_prediction_maps.tiff"),
+       p_oof_map,width=8,height=6,units="in",dpi=300,
+       compression="lzw",bg="white")
+```
+
+
+### Top 50% ranking performance
+```{r}
+## Top 51 county ranking performance
+top_n <- 51; n_counties <- nrow(oof)
+rank_cut <- 1-(top_n-1)/(n_counties-1)
+
+rank51 <- oof %>%
+  dplyr::select(COUNTY_NAM, LS_prop, RandomForest, XGBoost) %>%
+  dplyr::mutate(Observed_rank=rank(-LS_prop,ties.method="first"),
+                Observed_top51=Observed_rank<=top_n) %>%
+  tidyr::pivot_longer(c(RandomForest,XGBoost),names_to="Model",values_to="Predicted") %>%
+  dplyr::group_by(Model) %>%
+  dplyr::mutate(Predicted_rank=rank(-Predicted,ties.method="first"),
+                Predicted_top51=Predicted_rank<=top_n,
+                Correct_top51=Observed_top51 & Predicted_top51,
+                Observed_pct=1-(Observed_rank-1)/(n_counties-1),
+                Predicted_pct=1-(Predicted_rank-1)/(n_counties-1)) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(Model=dplyr::recode(Model,RandomForest="Random Forest",XGBoost="XGBoost"))
+
+## Top-51 overlap
+top51_summary <- rank51 %>%
+  dplyr::group_by(Model) %>%
+  dplyr::summarise(
+    Correctly_identified=sum(Correct_top51),
+    Top51_accuracy=100*Correctly_identified/51,
+    Jaccard=Correctly_identified/sum(Observed_top51 | Predicted_top51),
+    .groups="drop"
+  )
+
+print(top51_summary)
+
+## Top-51 ranking plot
+p_rank51 <- ggplot(rank51,aes(Observed_pct,Predicted_pct)) +
+  geom_abline(intercept=0,slope=1,linetype="dashed",linewidth=0.5) +
+  geom_vline(xintercept=rank_cut,linetype="dotted",linewidth=0.6) +
+  geom_hline(yintercept=rank_cut,linetype="dotted",linewidth=0.6) +
+  geom_point(aes(shape=Correct_top51),size=2.2,alpha=0.75) +
+  scale_shape_manual(values=c(`TRUE`=17,`FALSE`=16),
+                     labels=c(`TRUE`="Correctly identified top 51",
+                              `FALSE`="Other counties"),name=NULL) +
+  facet_wrap(~Model) +
+  scale_x_continuous(limits=c(0,1),breaks=seq(0,1,0.2)) +
+  scale_y_continuous(limits=c(0,1),breaks=seq(0,1,0.2)) +
+  labs(x="Observed percentile rank",y="Predicted percentile rank") +
+  theme_classic(base_size=12) +
+  theme(axis.title=element_text(face="bold"),
+        strip.text=element_text(face="bold",size=12),
+        legend.position="bottom")
+
+p_rank51
+
+
+## Top-51 recovery plot
+p_top51 <- ggplot(top51_summary,
+                  aes(x=Model, y=Top51_accuracy)) +
+  geom_col(width=0.55) +
+  geom_text(
+    aes(label=paste0(Correctly_identified,"/51 (",
+                     sprintf("%.1f",Top51_accuracy),"%)")),
+    vjust=-0.5, fontface="bold", size=4
+  ) +
+  scale_y_continuous(
+    limits=c(0,100),
+    breaks=seq(0,100,20),
+    expand=expansion(mult=c(0,0.06))
+  ) +
+  labs(
+    x=NULL,
+    y="Observed top-51 counties correctly identified (%)"
+  ) +
+  theme_classic(base_size=12) +
+  theme(
+    axis.title.y=element_text(face="bold",size=12),
+    axis.text.x=element_text(face="bold",size=12,color="black"),
+    axis.text.y=element_text(color="black")
+  )
+
+p_top51
+
+
+## Save top-51 recovery plot
+out_dir <- "C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Alpha Gal Risk in Illinois/Output"
+
+ggsave(
+  file.path(out_dir,"RF_XGBoost_top51_recovery.tiff"),
+  p_top51,
+  width=6, height=5, units="in",
+  dpi=300, compression="lzw", bg="white"
+)
+```
+
+
+```{r}
+## Statewide rank correlation across all 102 counties
+rank_correlation_102 <- data.frame(
+  Model=c("Random Forest","XGBoost"),
+  N=102,
+  Spearman_rho=c(
+    cor(oof$LS_prop,oof$RandomForest,method="spearman"),
+    cor(oof$LS_prop,oof$XGBoost,method="spearman")
+  ),
+  p_value=c(
+    cor.test(oof$LS_prop,oof$RandomForest,method="spearman",exact=FALSE)$p.value,
+    cor.test(oof$LS_prop,oof$XGBoost,method="spearman",exact=FALSE)$p.value
+  )
+)
+
+print(rank_correlation_102)
+
+
+## Rank-group agreement heatmap
+library(dplyr); library(tidyr); library(ggplot2)
+
+rank_group <- oof %>%
+  dplyr::select(COUNTY_NAM, LS_prop, RandomForest, XGBoost) %>%
+  mutate(Observed_rank=rank(-LS_prop,ties.method="average"),
+         Observed_group=pmin(5,ceiling(Observed_rank/(n()/5)))) %>%
+  pivot_longer(c(RandomForest,XGBoost),names_to="Model",values_to="Predicted") %>%
+  group_by(Model) %>%
+  mutate(Predicted_rank=rank(-Predicted,ties.method="average"),
+         Predicted_group=pmin(5,ceiling(Predicted_rank/(n()/5)))) %>%
+  ungroup() %>%
+  mutate(Model=recode(Model,RandomForest="Random Forest",XGBoost="XGBoost"),
+         Observed_group=factor(Observed_group,levels=1:5,
+           labels=c("Highest 20%","High","Middle","Low","Lowest 20%")),
+         Predicted_group=factor(Predicted_group,levels=1:5,
+           labels=c("Highest 20%","High","Middle","Low","Lowest 20%")))
+
+heat_dat <- rank_group %>%
+  count(Model,Observed_group,Predicted_group,name="Count")
+
+p_rank_heat <- ggplot(heat_dat,aes(Observed_group,Predicted_group,fill=Count)) +
+  geom_tile(color="white",linewidth=1) +
+  geom_text(aes(label=Count),fontface="bold",size=4) +
+  facet_wrap(~Model) +
+  scale_fill_viridis_c(option="plasma",name="Counties") +
+  labs(x="Observed rank group",y="Predicted rank group") +
+  theme_classic(base_size=12) +
+  theme(
+    axis.title=element_text(face="bold",size=12),
+    axis.text.x=element_text(angle=35,hjust=1,color="black"),
+    axis.text.y=element_text(color="black"),
+    strip.text=element_text(face="bold",size=12)
+  )
+
+p_rank_heat
+
+## Save rank-group heatmap
+out_dir <- "C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Alpha Gal Risk in Illinois/Output"
+
+ggsave(file.path(out_dir,"RF_XGBoost_rank_group_agreement.tiff"),
+       p_rank_heat,width=8,height=5.5,units="in",dpi=300,
+       compression="lzw",bg="white")
+
+```
+
+
+## join WUI 2020 COUNTY LEVE VALUES
+```{r}
+## Join WUI to dat by county name
+library(dplyr)
+
+wui_file <- "C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Alpha Gal Risk in Illinois/Data/WUI_IL_2020/Illinois_county_WUI_2020.csv"
+
+wui_county <- read.csv(wui_file)
+
+dat <- dat %>%
+  left_join(
+    wui_county %>%
+      select(COUNTY_NAM, Total_population_2020, WUI_population_2020,
+             WUI_population_prop, WUI_population_pct),
+    by="COUNTY_NAM"
+  )
+
+## Check merge
+cat("Counties:", nrow(dat), "\n")
+cat("Missing WUI:", sum(is.na(dat$WUI_population_prop)), "\n")
+cat("Duplicate counties:", sum(duplicated(dat$COUNTY_NAM)), "\n")
+
+stopifnot(
+  nrow(dat)==102,
+  !anyNA(dat$WUI_population_prop),
+  !anyDuplicated(dat$COUNTY_NAM)
+)
+
+head(
+  sf::st_drop_geometry(dat) %>%
+    select(COUNTY_NAM, Eh_Total_Case, WUI_population_prop, WUI_population_pct)
+)
+
+
+
+
+## Map WUI population proportion
+library(ggplot2)
+
+p_wui_map <- ggplot(dat) +
+  geom_sf(aes(fill=WUI_population_prop), color="white", linewidth=0.2) +
+  scale_fill_viridis_c(option="plasma", limits=c(0,1),
+                       name="WUI population\nproportion") +
+  coord_sf(datum=NA) +
+  theme_void(base_size=12) +
+  theme(
+    legend.position="right",
+    legend.title=element_text(face="bold",size=11)
+  )
+
+p_wui_map
+
+
+## Save WUI map
+out_dir <- "C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Alpha Gal Risk in Illinois/Output"
+
+ggsave(
+  file.path(out_dir,"WUI_population_proportion_map.tiff"),
+  p_wui_map, width=6, height=6, units="in",
+  dpi=300, compression="lzw", bg="white"
+)
+
+```
+
+
+
+##EHRLICHIOSIS CASES 
+```{r}
+## Ehrlichiosis average annual rate per 100,000
+library(dplyr); library(sf); library(ggplot2)
+
+dat <- dat %>%
+  mutate(
+    Eh_annual_rate_per100k = (Eh_Total_Case / 3) / Population * 100000
+  )
+
+## Check
+cat("Counties:", nrow(dat), "\n")
+cat("Missing rates:", sum(is.na(dat$Eh_annual_rate_per100k)), "\n")
+cat("Infinite rates:", sum(is.infinite(dat$Eh_annual_rate_per100k)), "\n")
+
+summary(dat$Eh_annual_rate_per100k)
+
+dat %>%
+  st_drop_geometry() %>%
+  select(COUNTY_NAM, Eh_Total_Case, Population, Eh_annual_rate_per100k) %>%
+  arrange(desc(Eh_annual_rate_per100k)) %>%
+  print(n=102)
+
+## Export CSV
+out_dir <- "C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Alpha Gal Risk in Illinois/Output"
+dir.create(out_dir, recursive=TRUE, showWarnings=FALSE)
+
+ehr_rate_csv <- dat %>%
+  st_drop_geometry() %>%
+  select(COUNTY_NAM, Eh_annual_rate_per100k)
+
+write.csv(
+  ehr_rate_csv,
+  file.path(out_dir,"Illinois_county_ehrlichiosis_annual_rate_per100k.csv"),
+  row.names=FALSE
+)
+
+## Map annual ehrlichiosis rate
+p_ehr_rate <- ggplot(dat) +
+  geom_sf(aes(fill=Eh_annual_rate_per100k), color="white", linewidth=0.2) +
+  scale_fill_viridis_c(option="plasma", name="Cases per\n100,000/year") +
+  labs(title="Ehrlichiosis") +
+  theme_void(base_size=12) +
+  theme(
+    plot.title=element_text(face="bold", hjust=0.5),
+    legend.title=element_text(face="bold")
+  )
+
+p_ehr_rate
+
+## Export map
+out_dir <- "C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Alpha Gal Risk in Illinois/Output"
+
+ggsave(
+  file.path(out_dir,"Illinois_ehrlichiosis_annual_rate_per100k_map.tiff"),
+  p_ehr_rate,
+  width=6, height=7, units="in",
+  dpi=300, compression="lzw", bg="white"
+)
+
+
+
+
+## Log-transform and scale ehrlichiosis rate 0–1
+dat <- dat %>%
+  mutate(
+    Eh_log = log1p(Eh_annual_rate_per100k),
+    Eh_scaled = (Eh_log - min(Eh_log, na.rm=TRUE)) /
+                (max(Eh_log, na.rm=TRUE) - min(Eh_log, na.rm=TRUE))
+  )
+
+cat("Scaled ehrlichiosis range:", range(dat$Eh_scaled, na.rm=TRUE), "\n")
+cat("Missing scaled values:", sum(is.na(dat$Eh_scaled)), "\n")
+
+## Export scaled ehrlichiosis CSV
+ehr_scaled_csv <- dat %>%
+  st_drop_geometry() %>%
+  select(COUNTY_NAM, Eh_annual_rate_per100k, Eh_log, Eh_scaled)
+
+write.csv(
+  ehr_scaled_csv,
+  file.path(out_dir,"Illinois_county_ehrlichiosis_log_scaled.csv"),
+  row.names=FALSE
+)
+
+## Map scaled ehrlichiosis
+p_ehr_scaled <- ggplot(dat) +
+  geom_sf(aes(fill=Eh_scaled), color="white", linewidth=0.2) +
+  scale_fill_viridis_c(
+    option="plasma",
+    limits=c(0,1),
+    name="Scaled\nindex"
+  ) +
+  labs(title="Ehrlichiosis") +
+  theme_void(base_size=12) +
+  theme(
+    plot.title=element_text(face="bold", hjust=0.5),
+    legend.title=element_text(face="bold")
+  )
+
+p_ehr_scaled
+
+## Export scaled map
+ggsave(
+  file.path(out_dir,"Illinois_ehrlichiosis_log_scaled_map.tiff"),
+  p_ehr_scaled,
+  width=6, height=7, units="in",
+  dpi=300, compression="lzw", bg="white"
+)
+```
+
+## Primary AGS exposure-risk index: 70% tick + 30% ehrlichiosis
+```{r}
+## Primary AGS exposure-risk indices: 70% tick + 30% ehrlichiosis
+ags_primary <- dat %>%
+  left_join(
+    oof %>% select(COUNTY_NAM, RandomForest, XGBoost),
+    by="COUNTY_NAM"
+  ) %>%
+  mutate(
+    RF_component_70 = 0.70 * RandomForest,
+    XGB_component_70 = 0.70 * XGBoost,
+    Eh_component_30 = 0.30 * Eh_scaled,
+    RF_AGS_index = RF_component_70 + Eh_component_30,
+    XGB_AGS_index = XGB_component_70 + Eh_component_30
+  )
+
+## Check
+cat("Counties:", nrow(ags_primary), "\n")
+cat("Missing RF index:", sum(is.na(ags_primary$RF_AGS_index)), "\n")
+cat("Missing XGB index:", sum(is.na(ags_primary$XGB_AGS_index)), "\n")
+cat("RF index range:", range(ags_primary$RF_AGS_index, na.rm=TRUE), "\n")
+cat("XGB index range:", range(ags_primary$XGB_AGS_index, na.rm=TRUE), "\n")
+
+ags_primary %>%
+  st_drop_geometry() %>%
+  select(
+    COUNTY_NAM,
+    RandomForest,
+    XGBoost,
+    Eh_scaled,
+    RF_component_70,
+    XGB_component_70,
+    Eh_component_30,
+    RF_AGS_index,
+    XGB_AGS_index
+  ) %>%
+  arrange(desc(XGB_AGS_index)) %>%
+  print(n=102)
+
+## Export CSV
+out_dir <- "C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Alpha Gal Risk in Illinois/Output"
+dir.create(out_dir, recursive=TRUE, showWarnings=FALSE)
+
+ags_primary %>%
+  st_drop_geometry() %>%
+  select(
+    COUNTY_NAM,
+    RandomForest,
+    XGBoost,
+    Eh_scaled,
+    RF_component_70,
+    XGB_component_70,
+    Eh_component_30,
+    RF_AGS_index,
+    XGB_AGS_index
+  ) %>%
+  write.csv(
+    file.path(out_dir,"AGS_primary_indices_RF_XGB_70Tick_30Ehrlichiosis.csv"),
+    row.names=FALSE
+  )
+
+## Maps
+p_rf_primary <- ggplot(ags_primary) +
+  geom_sf(aes(fill=RF_AGS_index), color="white", linewidth=0.2) +
+  scale_fill_viridis_c(
+    option="plasma",
+    limits=c(0,1),
+    name="AGS exposure\nrisk index"
+  ) +
+  labs(title="Random Forest") +
+  theme_void(base_size=12) +
+  theme(
+    plot.title=element_text(face="bold", hjust=0.5),
+    legend.title=element_text(face="bold")
+  )
+
+p_xgb_primary <- ggplot(ags_primary) +
+  geom_sf(aes(fill=XGB_AGS_index), color="white", linewidth=0.2) +
+  scale_fill_viridis_c(
+    option="plasma",
+    limits=c(0,1),
+    name="AGS exposure\nrisk index"
+  ) +
+  labs(title="XGBoost") +
+  theme_void(base_size=12) +
+  theme(
+    plot.title=element_text(face="bold", hjust=0.5),
+    legend.title=element_text(face="bold")
+  )
+
+p_primary <- (p_rf_primary | p_xgb_primary) +
+  plot_layout(guides="collect") &
+  theme(legend.position="right")
+
+p_primary
+
+## Export map
+ggsave(
+  file.path(out_dir,"AGS_primary_RF_XGB_70Tick_30Ehrlichiosis_maps.tiff"),
+  p_primary,
+  width=8, height=6, units="in",
+  dpi=300, compression="lzw", bg="white"
+)
+
+```
+
+## Sensitivity index: 70% tick + 20% ehrlichiosis + 10% WUI
+```{r}
+## Sensitivity indices: 70% tick + 20% ehrlichiosis + 10% WUI
+ags_sensitivity <- ags_primary %>%
+  mutate(
+    RF_component_70 = 0.70 * RandomForest,
+    XGB_component_70 = 0.70 * XGBoost,
+    Eh_component_20 = 0.20 * Eh_scaled,
+    WUI_component_10 = 0.10 * WUI_population_prop,
+    RF_AGS_sensitivity = RF_component_70 + Eh_component_20 + WUI_component_10,
+    XGB_AGS_sensitivity = XGB_component_70 + Eh_component_20 + WUI_component_10
+  )
+
+## Check
+cat("Missing RF sensitivity index:",
+    sum(is.na(ags_sensitivity$RF_AGS_sensitivity)), "\n")
+cat("Missing XGB sensitivity index:",
+    sum(is.na(ags_sensitivity$XGB_AGS_sensitivity)), "\n")
+
+## Export CSV
+out_dir <- "C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Alpha Gal Risk in Illinois/Output"
+
+ags_sensitivity %>%
+  st_drop_geometry() %>%
+  select(
+    COUNTY_NAM,
+    RandomForest,
+    XGBoost,
+    Eh_scaled,
+    WUI_population_prop,
+    RF_component_70,
+    XGB_component_70,
+    Eh_component_20,
+    WUI_component_10,
+    RF_AGS_sensitivity,
+    XGB_AGS_sensitivity
+  ) %>%
+  write.csv(
+    file.path(out_dir,"AGS_sensitivity_indices_RF_XGB_70Tick_20Ehrlichiosis_10WUI.csv"),
+    row.names=FALSE
+  )
+
+## Maps
+p_rf_sens <- ggplot(ags_sensitivity) +
+  geom_sf(aes(fill=RF_AGS_sensitivity), color="white", linewidth=0.2) +
+  scale_fill_viridis_c(
+    option="plasma",
+    limits=c(0,1),
+    name="AGS exposure\nrisk index"
+  ) +
+  labs(title="Random Forest") +
+  theme_void(base_size=12) +
+  theme(
+    plot.title=element_text(face="bold", hjust=0.5),
+    legend.title=element_text(face="bold")
+  )
+
+p_xgb_sens <- ggplot(ags_sensitivity) +
+  geom_sf(aes(fill=XGB_AGS_sensitivity), color="white", linewidth=0.2) +
+  scale_fill_viridis_c(
+    option="plasma",
+    limits=c(0,1),
+    name="AGS exposure\nrisk index"
+  ) +
+  labs(title="XGBoost") +
+  theme_void(base_size=12) +
+  theme(
+    plot.title=element_text(face="bold", hjust=0.5),
+    legend.title=element_text(face="bold")
+  )
+
+p_sensitivity <- (p_rf_sens | p_xgb_sens) +
+  plot_layout(guides="collect") &
+  theme(legend.position="right")
+
+p_sensitivity
+
+## Export map
+ggsave(
+  file.path(out_dir,"AGS_sensitivity_RF_XGB_70Tick_20Ehrlichiosis_10WUI_maps.tiff"),
+  p_sensitivity,
+  width=8, height=6, units="in",
+  dpi=300, compression="lzw", bg="white"
+)
+```
+
+
+
+
+##############################     AGS VALIDATION     #############################
+
+
+## Import and join CDC AGS categories using cleaned county names
+```{r}
+## Import and join CDC AGS categories using cleaned county names
+library(dplyr)
+
+data_dir <- "C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Alpha Gal Risk in Illinois/Data"
+
+ags <- read.csv(file.path(
+  data_dir,
+  "Illinois_CDC_AGS_categories_2017_2022_digitized.csv"
+))
+
+## Create identical county-name keys
+ags <- ags %>%
+  mutate(COUNTY_KEY=toupper(gsub("[^A-Za-z0-9]","",COUNTY_NAM)))
+
+ags_val <- ags_sensitivity %>%
+  st_drop_geometry() %>%
+  mutate(COUNTY_KEY=toupper(gsub("[^A-Za-z0-9]","",COUNTY_NAM)))
+
+## Check names before joining
+anti_join(
+  ags_val %>% dplyr::select(COUNTY_NAM,COUNTY_KEY),
+  ags %>% dplyr::select(COUNTY_KEY),
+  by="COUNTY_KEY"
+)
+
+## Join CDC categories
+ags_val <- ags_val %>%
+  left_join(
+    ags %>%
+      dplyr::select(COUNTY_KEY,AGS_category,AGS_category_label,QC_status),
+    by="COUNTY_KEY"
+  ) %>%
+  mutate(AGS_ord=na_if(AGS_category,-1))
+
+## Check
+nrow(ags_val)
+sum(is.na(ags_val$AGS_category))
+sum(is.na(ags_val$AGS_ord))
+table(ags_val$AGS_category_label,useNA="ifany")
+
+```
+
+
+## Weighting sensitivity analysis: 50:50, 60:40, 70:30, 80:20
+```{r}
+
+## Weighting sensitivity including WUI (70:20:10)
+library(dplyr); library(ggplot2)
+
+d <- sf::st_drop_geometry(ags_sensitivity) %>%
+  mutate(COUNTY_KEY=toupper(gsub("[^A-Za-z0-9]","",COUNTY_NAM))) %>%
+  left_join(ags_val %>% distinct(COUNTY_KEY,.keep_all=TRUE) %>%
+              select(COUNTY_KEY,AGS_ord),by="COUNTY_KEY")
+
+stopifnot(nrow(d)==102, sum(!is.na(d$AGS_ord))==97)
+
+weights <- c(.50,.60,.70,.80)
+labels <- c("50:50","60:40","70:30","80:20","70:20:10 WUI")
+
+calculate <- function(pred,model) {
+  scores <- cbind(
+    sapply(weights,function(w) w*pred+(1-w)*d$Eh_scaled),
+    .70*pred+.20*d$Eh_scaled+.10*d$WUI_population_prop
+  )
+  colnames(scores) <- labels
+
+  ## Correlations between indices: 102 counties
+  internal <- as.data.frame(as.table(cor(scores,method="spearman")))
+  names(internal) <- c("Scenario","Compared_with","Rho")
+  internal <- internal %>% mutate(Model=model,Comparison="Between indices",N=102)
+
+  ## Correlations with CDC categories: 97 counties
+  valid <- !is.na(d$AGS_ord)
+  external <- data.frame(
+    Model=model,Comparison="CDC categories",Scenario=labels,
+    Compared_with="CDC categories",N=sum(valid),
+    Rho=as.vector(cor(scores[valid,,drop=FALSE],
+                      d$AGS_ord[valid],method="spearman"))
+  )
+  bind_rows(internal,external)
+}
+
+results <- bind_rows(
+  calculate(d$RandomForest,"Random Forest"),
+  calculate(d$XGBoost,"XGBoost")
+)
+
+print(results)
+write.csv(results,file.path(out_dir,"AGS_weighting_sensitivity_comparison.csv"),
+          row.names=FALSE)
+
+## Figure S7: Five-scenario internal correlation heatmaps
+plotdat <- results %>%
+  filter(Comparison=="Between indices") %>%
+  mutate(Scenario=factor(Scenario,levels=labels),
+         Compared_with=factor(Compared_with,levels=rev(labels)))
+
+p <- ggplot(plotdat,aes(Scenario,Compared_with,fill=Rho)) +
+  geom_tile(color="white",linewidth=0.8) +
+  geom_text(aes(label=sprintf("%.3f",Rho),
+              color=Rho >= 0.99),
+          size=3.7, fontface="bold") +
+scale_color_manual(
+  values=c("TRUE"="black","FALSE"="white"),
+  guide="none"
+) +
+  facet_wrap(~Model,nrow=1) +
+  scale_fill_viridis_c(
+  option = "D",
+  limits = c(0.95, 1),
+  name = "Spearman rank correlation (ρ)"
+) +
+  coord_equal() +
+  labs(x="AGS index weighting scenario",y=NULL) +
+  theme_classic(base_size=12) +
+  theme(strip.text=element_text(face="bold",size=13),
+        axis.text.x=element_text(angle=35,hjust=1,face="bold"),
+        axis.text.y=element_text(face="bold"),
+        axis.title.x=element_text(face="bold"))
+
+p <- p +
+  guides(fill = guide_colorbar(
+    direction = "vertical",
+    barheight = grid::unit(10, "cm"),
+    barwidth = grid::unit(0.45, "cm"),
+    title.position = "right",
+    title.theme = element_text(
+      angle = 90,
+      hjust = 0.5,
+      vjust = 0.5,
+      face = "bold"
+    )
+  )) +
+  theme(
+    legend.position = "right",
+    legend.direction = "vertical",
+    axis.text.x = element_text(angle = 35, hjust = 1,
+                               face = "plain", color = "black"),
+    axis.text.y = element_text(face = "plain", color = "black"),
+    axis.title.x = element_text(face = "bold"),
+    axis.title.y = element_text(face = "bold"),
+    strip.text = element_text(face = "bold")
+  )
+ggsave(file.path(out_dir,"Figure_S7_weighting_WUI_correlations.tiff"),
+       p,width=10,height=5,units="in",
+       dpi=600,compression="lzw",bg="white")
+
+
+```
+
+
+
+## Descriptive statistics for CDC suspected AGS categories
+```{r}
+## Descriptive statistics for CDC suspected AGS categories
+ags_desc <- ags_val %>%
+  mutate(
+    CDC_category=case_when(
+      AGS_category==3  ~ ">87 Suspected cases",
+      AGS_category==2  ~ "11–87 Suspected cases",
+      AGS_category==1  ~ "<11 Suspected cases",
+      AGS_category==0  ~ "0 Suspected cases",
+      AGS_category==-1 ~ "No testing performed"
+    ),
+    CDC_category=factor(
+      CDC_category,
+      levels=c(">87 Suspected cases","11–87 Suspected cases",
+               "<11 Suspected cases","0 Suspected cases",
+               "No testing performed")
+    )
+  )
+
+n_tested <- sum(ags_desc$AGS_category!=-1)
+
+ags_summary <- ags_desc %>%
+  count(CDC_category, name="Count", .drop=FALSE) %>%
+  mutate(
+    Percent_all=100*Count/nrow(ags_desc),
+    Percent_tested=ifelse(CDC_category=="No testing performed",
+                          NA,100*Count/n_tested)
+  )
+
+print(ags_summary)
+cat("\nTotal counties:",nrow(ags_desc),
+    "\nCounties with testing:",n_tested,
+    "\nNo testing performed:",sum(ags_desc$AGS_category==-1),"\n")
+
+## Save descriptive statistics
+out_dir <- "C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Alpha Gal Risk in Illinois/Output"
+
+write.csv(
+  ags_summary,
+  file.path(out_dir,"CDC_AGS_category_descriptive_statistics.csv"),
+  row.names=FALSE
+)
+
+## Map CDC suspected AGS categories in Illinois
+library(sf); library(ggplot2)
+
+ags_map <- dat %>%
+  mutate(COUNTY_KEY=toupper(gsub("[^A-Za-z0-9]","",COUNTY_NAM))) %>%
+  left_join(
+    ags_desc %>% dplyr::select(COUNTY_KEY,CDC_category),
+    by="COUNTY_KEY"
+  )
+
+cdc_cols <- c(
+  ">87 Suspected cases"="#084594",
+  "11–87 Suspected cases"="#5B8CCB",
+  "<11 Suspected cases"="#C7D5EB",
+  "0 Suspected cases"="white",
+  "No testing performed"="#BDBDBD"
+)
+
+p_ags_map <- ggplot(ags_map) +
+  geom_sf(aes(fill=CDC_category),color="grey45",linewidth=0.35) +
+  scale_fill_manual(
+    values=cdc_cols,
+    drop=FALSE,
+    name="Per 1 million population per year (PPY)"
+  ) +
+  coord_sf(datum=NA) +
+  theme_void(base_size=12) +
+  theme(
+    legend.position="right",
+    legend.title=element_text(face="bold",size=11),
+    legend.text=element_text(size=10),
+    plot.margin=margin(8,8,8,8)
+  )
+
+p_ags_map
+
+## Save CDC suspected AGS category map
+out_dir <- "C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Alpha Gal Risk in Illinois/Output"
+
+ggsave(
+  file.path(out_dir,"Illinois_CDC_suspected_AGS_categories_2017_2022.tiff"),
+  p_ags_map,
+  width=7.5,height=7,units="in",
+  dpi=300,compression="lzw",bg="white"
+)
+```
+
+
+
+## External validation against CDC suspected AGS categorie through Spearman correlation  + bootstrap 95% CI
+```{r}
+## External validation against CDC suspected AGS categories
+library(dplyr); library(tidyr); library(ggplot2)
+
+ags_test <- ags_val %>%
+  filter(!is.na(AGS_ord)) %>%
+  mutate(
+    AGS_group=factor(
+      AGS_ord,
+      levels=0:3,
+      labels=c("0","<11","11–87",">87")
+    )
+  )
+
+## Number of counties in each AGS category
+table(ags_test$AGS_group)
+
+## Spearman correlation + bootstrap 95% CI
+set.seed(123); B <- 5000
+
+spearman_ci <- function(y,x,B=5000){
+  n <- length(y)
+  rb <- replicate(B,{
+    i <- sample.int(n,n,replace=TRUE)
+    cor(y[i],x[i],method="spearman")
+  })
+
+  data.frame(
+    rho=cor(y,x,method="spearman"),
+    CI_low=unname(quantile(rb,0.025,na.rm=TRUE)),
+    CI_high=unname(quantile(rb,0.975,na.rm=TRUE)),
+    p=cor.test(y,x,method="spearman",exact=FALSE)$p.value
+  )
+}
+
+## Validation correlations
+ags_cor <- bind_rows(
+  cbind(Index="Random Forest primary",
+        spearman_ci(ags_test$AGS_ord,ags_test$RF_AGS_index,B)),
+  cbind(Index="XGBoost primary",
+        spearman_ci(ags_test$AGS_ord,ags_test$XGB_AGS_index,B)),
+  cbind(Index="Random Forest sensitivity",
+        spearman_ci(ags_test$AGS_ord,ags_test$RF_AGS_sensitivity,B)),
+  cbind(Index="XGBoost sensitivity",
+        spearman_ci(ags_test$AGS_ord,ags_test$XGB_AGS_sensitivity,B))
+)
+
+print(ags_cor)
+
+## Save correlation results
+out_dir <- "C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Alpha Gal Risk in Illinois/Output"
+
+write.csv(
+  ags_cor,
+  file.path(out_dir,"CDC_AGS_external_validation_final_indices.csv"),
+  row.names=FALSE
+)
+
+## Primary validation plotting data
+ags_plot_primary <- ags_test %>%
+  select(AGS_group,RF_AGS_index,XGB_AGS_index) %>%
+  pivot_longer(
+    c(RF_AGS_index,XGB_AGS_index),
+    names_to="Model",
+    values_to="AGS_index"
+  ) %>%
+  mutate(
+    Model=recode(
+      Model,
+      RF_AGS_index="Random Forest",
+      XGB_AGS_index="XGBoost"
+    )
+  )
+
+
+model_fill <- c(
+  "Random Forest" = "#E3ECF7",
+  "XGBoost" = "#DDF1EC"
+)
+
+model_point <- c(
+  "Random Forest" = "#315B91",
+  "XGBoost" = "#087F72"
+)
+
+## Primary validation figure
+p_ags_primary <- ggplot(
+  ags_plot_primary,
+  aes(AGS_group,AGS_index,fill=Model)
+) +
+  geom_violin(aes(color=Model), width=0.85,
+            trim=TRUE, alpha=1, linewidth=0.6) +
+geom_boxplot(width=0.20, outlier.shape=NA,
+             fill="white", color="#333333",
+             linewidth=0.65) +
+geom_jitter(aes(color=Model), width=0.10,
+            size=1.5, alpha=0.65) +
+  stat_summary(aes(group=1),fun=median,geom="line",
+               color="black",linewidth=0.9) +
+  stat_summary(fun=median,geom="point",shape=23,size=3.2,
+               fill="white",color="black",stroke=0.8) +
+  facet_wrap(~Model) +
+scale_fill_manual(values=model_fill) +
+scale_color_manual(values=model_point) +
+  labs(
+    x="Suspected AGS cases per 1 million population per year",
+    y="AGS exposure-risk index"
+  ) +
+  theme_classic(base_size=12) +
+  theme(
+    legend.position="none",
+    axis.title.x=element_text(face="bold",size=12),
+    axis.title.y=element_text(face="bold",size=12),
+    axis.text=element_text(color="black",size=10.5),
+    strip.text=element_text(face="bold",size=12),
+    strip.background=element_rect(fill="grey95",color="black")
+  )
+
+p_ags_primary
+
+## Save primary validation figure
+ggsave(
+  file.path(out_dir,"RF_XGBoost_primary_AGS_index_external_validation_CDC.tiff"),
+  p_ags_primary,
+  width=8,height=5,units="in",
+  dpi=300,compression="lzw",bg="white"
+)
+
+## Sensitivity validation plotting data
+ags_plot_sensitivity <- ags_test %>%
+  select(
+    AGS_group,
+    RF_AGS_sensitivity,
+    XGB_AGS_sensitivity
+  ) %>%
+  pivot_longer(
+    c(RF_AGS_sensitivity,XGB_AGS_sensitivity),
+    names_to="Model",
+    values_to="AGS_index"
+  ) %>%
+  mutate(
+    Model=recode(
+      Model,
+      RF_AGS_sensitivity="Random Forest",
+      XGB_AGS_sensitivity="XGBoost"
+    )
+  )
+
+## Sensitivity validation figure
+p_ags_sensitivity <- ggplot(
+  ags_plot_sensitivity,
+  aes(AGS_group,AGS_index,fill=Model)
+) +
+  geom_violin(aes(color=Model), width=0.85,
+            trim=TRUE, alpha=1, linewidth=0.6) +
+geom_boxplot(width=0.20, outlier.shape=NA,
+             fill="white", color="#333333",
+             linewidth=0.65) +
+geom_jitter(aes(color=Model), width=0.10,
+            size=1.5, alpha=0.65) +
+  stat_summary(aes(group=1),fun=median,geom="line",
+               color="black",linewidth=0.9) +
+  stat_summary(fun=median,geom="point",shape=23,size=3.2,
+               fill="white",color="black",stroke=0.8) +
+  facet_wrap(~Model) +
+ scale_fill_manual(values=model_fill) +
+ scale_color_manual(values=model_point) +
+  labs(
+    x="Suspected AGS cases per 1 million population per year",
+    y="AGS exposure-risk index"
+  ) +
+  theme_classic(base_size=12) +
+  theme(
+    legend.position="none",
+    axis.title.x=element_text(face="bold",size=12),
+    axis.title.y=element_text(face="bold",size=12),
+    axis.text=element_text(color="black",size=10.5),
+    strip.text=element_text(face="bold",size=12),
+    strip.background=element_rect(fill="grey95",color="black")
+  )
+
+p_ags_sensitivity
+
+## Save sensitivity validation figure
+ggsave(
+  file.path(out_dir,"RF_XGBoost_sensitivity_AGS_index_external_validation_CDC.tiff"),
+  p_ags_sensitivity,
+  width=8,height=5,units="in",
+  dpi=300,compression="lzw",bg="white"
+)
+
+```
+
+## Check proportional-odds assumption first before Ordinal logistic validation
+```{r}
+## Check proportional-odds assumption first
+library(ordinal)
+
+ags_test <- ags_test %>%
+  mutate(
+    AGS_ord_factor=factor(
+      AGS_ord,
+      levels=0:3,
+      labels=c("0","<11","11–87",">87"),
+      ordered=TRUE
+    )
+  )
+
+m_rf <- clm(AGS_ord_factor ~ I(RF_AGS_index*10),data=ags_test,link="logit")
+m_xgb <- clm(AGS_ord_factor ~ I(XGB_AGS_index*10),data=ags_test,link="logit")
+
+nominal_test(m_rf)
+nominal_test(m_xgb)
+
+
+## Export proportional-odds assumption test
+nt_rf <- as.data.frame(nominal_test(m_rf))
+nt_xgb <- as.data.frame(nominal_test(m_xgb))
+
+nominal_results <- bind_rows(
+  data.frame(Model="Random Forest",nt_rf[2,,drop=FALSE],row.names=NULL),
+  data.frame(Model="XGBoost",nt_xgb[2,,drop=FALSE],row.names=NULL)
+)
+
+print(nominal_results)
+
+## Export CSV
+out_dir <- "C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Alpha Gal Risk in Illinois/Output"
+
+write.csv(
+  nominal_results,
+  file.path(out_dir,"CDC_AGS_proportional_odds_assumption_tests.csv"),
+  row.names=FALSE
+)
+```
+
+
+## Non-proportional Ordinal logistic validation: Random Forest + XGBoost
+```{r}
+
+## Non-proportional ordinal validation: primary + sensitivity
+library(dplyr); library(tidyr); library(ggplot2); library(ordinal)
+
+## Fit non-proportional ordinal models
+m_rf_np <- clm(AGS_ord_factor~1,nominal=~I(RF_AGS_index*10),data=ags_test,link="logit")
+m_xgb_np <- clm(AGS_ord_factor~1,nominal=~I(XGB_AGS_index*10),data=ags_test,link="logit")
+m_rf_sens_np <- clm(AGS_ord_factor~1,nominal=~I(RF_AGS_sensitivity*10),data=ags_test,link="logit")
+m_xgb_sens_np <- clm(AGS_ord_factor~1,nominal=~I(XGB_AGS_sensitivity*10),data=ags_test,link="logit")
+
+## Extract threshold-specific ORs per 0.10 increase
+get_np_or <- function(model,name,analysis){
+  b <- coef(summary(model)); rn <- rownames(b)
+  keep <- !grepl("\\(Intercept\\)",rn)
+  b <- b[keep,,drop=FALSE]; rn <- rn[keep]
+  data.frame(Analysis=analysis,Model=name,Threshold=sub("\\..*$","",rn),
+             OR_per_0.10=exp(-b[,"Estimate"]),
+             CI_low=exp(-(b[,"Estimate"]+1.96*b[,"Std. Error"])),
+             CI_high=exp(-(b[,"Estimate"]-1.96*b[,"Std. Error"])),
+             p=2*pnorm(-abs(b[,"z value"])),row.names=NULL)
+}
+
+np_results <- bind_rows(
+  get_np_or(m_rf_np,"Random Forest","Primary"),
+  get_np_or(m_xgb_np,"XGBoost","Primary"),
+  get_np_or(m_rf_sens_np,"Random Forest","Sensitivity"),
+  get_np_or(m_xgb_sens_np,"XGBoost","Sensitivity")
+)
+
+print(np_results)
+
+## Export regression results
+out_dir <- "C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Alpha Gal Risk in Illinois/Output"
+write.csv(np_results,file.path(out_dir,"CDC_AGS_nonproportional_ordinal_validation.csv"),row.names=FALSE)
+
+## Function to generate predicted probabilities
+make_prob <- function(model,var,x,name){
+  nd <- data.frame(x)
+  names(nd) <- var
+  pr <- as.data.frame(predict(model,newdata=nd,type="prob")$fit)
+
+  cbind(AGS_index=x,pr) %>%
+    pivot_longer(-AGS_index,names_to="CDC_category",values_to="Probability") %>%
+    mutate(Model=name)
+}
+
+## Primary probabilities
+rf_x <- seq(min(ags_test$RF_AGS_index),max(ags_test$RF_AGS_index),length.out=200)
+xgb_x <- seq(min(ags_test$XGB_AGS_index),max(ags_test$XGB_AGS_index),length.out=200)
+
+prob_primary <- bind_rows(
+  make_prob(m_rf_np,"RF_AGS_index",rf_x,"Random Forest"),
+  make_prob(m_xgb_np,"XGB_AGS_index",xgb_x,"XGBoost")
+)
+
+## Order categories and use publication-quality colors
+prob_primary <- prob_primary %>%
+  mutate(CDC_category=factor(CDC_category,
+                             levels=c("0","<11","11–87",">87")))
+
+p_np_primary <- ggplot(prob_primary,aes(AGS_index,Probability,color=CDC_category)) +
+  geom_line(linewidth=1.2) +
+  facet_wrap(~Model,scales="free_x") +
+  scale_color_manual(
+    values=c(
+      "0"="#2B2B2B",
+      "<11"="#2166AC",
+      "11–87"="#762A83",
+      ">87"="#B2182B"
+    ),
+    drop=FALSE
+  ) +
+  scale_y_continuous(limits=c(0,1),breaks=seq(0,1,0.2)) +
+  labs(x="AGS exposure-risk index",
+       y="Predicted probability",
+       color="CDC suspected AGS category") +
+  theme_classic(base_size=12) +
+  theme(
+    axis.title=element_text(face="bold"),
+    axis.text=element_text(color="black"),
+    strip.text=element_text(face="bold"),
+    strip.background=element_rect(fill="grey95",color="black"),
+    legend.title=element_text(face="bold")
+  )
+
+p_np_primary
+
+ggsave(file.path(out_dir,"CDC_AGS_nonproportional_primary_RF_XGBoost.tiff"),
+       p_np_primary,width=9,height=5.5,units="in",dpi=300,compression="lzw",bg="white")
+
+## Sensitivity probabilities
+rf_sx <- seq(min(ags_test$RF_AGS_sensitivity),max(ags_test$RF_AGS_sensitivity),length.out=200)
+xgb_sx <- seq(min(ags_test$XGB_AGS_sensitivity),max(ags_test$XGB_AGS_sensitivity),length.out=200)
+
+prob_sens <- bind_rows(
+  make_prob(m_rf_sens_np,"RF_AGS_sensitivity",rf_sx,"Random Forest"),
+  make_prob(m_xgb_sens_np,"XGB_AGS_sensitivity",xgb_sx,"XGBoost")
+)
+
+
+prob_sens <- prob_sens %>%
+  mutate(CDC_category=factor(CDC_category,
+                             levels=c("0","<11","11–87",">87")))
+
+## Sensitivity plot
+p_np_sens <- ggplot(prob_sens,aes(AGS_index,Probability,color=CDC_category)) +
+  geom_line(linewidth=1.2) +
+  facet_wrap(~Model,scales="free_x") +
+  scale_color_manual(
+    values=c(
+      "0"="#2B2B2B",
+      "<11"="#2166AC",
+      "11–87"="#762A83",
+      ">87"="#B2182B"
+    ),
+    drop=FALSE
+  ) +
+  scale_y_continuous(limits=c(0,1),breaks=seq(0,1,0.2)) +
+  labs(
+    x="AGS exposure-risk index",
+    y="Predicted probability",
+    color="CDC suspected AGS category"
+  ) +
+  theme_classic(base_size=12) +
+  theme(
+    axis.title=element_text(face="bold"),
+    axis.text=element_text(color="black"),
+    strip.text=element_text(face="bold"),
+    strip.background=element_rect(fill="grey95",color="black"),
+    legend.title=element_text(face="bold")
+  )
+
+p_np_sens
+
+ggsave(file.path(out_dir,"CDC_AGS_nonproportional_sensitivity_RF_XGBoost.tiff"),
+       p_np_sens,width=9,height=5.5,units="in",dpi=300,compression="lzw",bg="white")
+
+
+```
+
+
+##Print and export threshold-specific ORs from non-proportional models
+
+```{r}
+## Print and export threshold-specific ORs from non-proportional models
+get_np_or <- function(model,name,analysis){
+  s <- coef(summary(model))
+  s <- s[grepl("I\\(",rownames(s)),,drop=FALSE]
+
+  threshold_clean <- case_when(
+  grepl("^0\\|<11",rownames(s)) ~ "0 vs >0",
+  grepl("^<11\\|11",rownames(s)) ~ "0/<11 vs 11-87/>87",
+  grepl("^11",rownames(s)) ~ "0/<11/11-87 vs >87",
+  TRUE ~ rownames(s)
+)
+  data.frame(
+    Analysis=analysis,
+    Model=name,
+    Threshold=threshold_clean,
+    OR_per_0.10=exp(-s[,"Estimate"]),
+    CI_low=exp(-(s[,"Estimate"]+1.96*s[,"Std. Error"])),
+    CI_high=exp(-(s[,"Estimate"]-1.96*s[,"Std. Error"])),
+    p_value=2*pnorm(-abs(s[,"z value"])),
+    row.names=NULL
+  )
+}
+
+np_results <- bind_rows(
+  get_np_or(m_rf_np,"Random Forest","Primary"),
+  get_np_or(m_xgb_np,"XGBoost","Primary"),
+  get_np_or(m_rf_sens_np,"Random Forest","Sensitivity"),
+  get_np_or(m_xgb_sens_np,"XGBoost","Sensitivity")
+)
+
+print(np_results)
+
+## Export CSV
+out_dir <- "C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Alpha Gal Risk in Illinois/Output"
+
+write.csv(
+  np_results,
+  file.path(out_dir,"CDC_AGS_nonproportional_threshold_specific_ORs.csv"),
+  row.names=FALSE,
+  fileEncoding="UTF-8"
+)
+```
+
+
+## Spatial averaging: 50% focal county + 50% adjacent counties
+```{r}
+## Spatial averaging: 50% focal county + 50% adjacent counties
+library(sf); library(spdep); library(dplyr)
+
+risk_sf <- st_make_valid(ags_sensitivity)
+nb <- poly2nb(risk_sf,queen=TRUE)
+
+indices <- c("RF_AGS_index","XGB_AGS_index",
+             "RF_AGS_sensitivity","XGB_AGS_sensitivity")
+
+stopifnot(!anyNA(st_drop_geometry(risk_sf)[indices]))
+
+for(v in indices){
+  x <- risk_sf[[v]]
+  risk_sf[[paste0(v,"_sp50")]] <- vapply(seq_along(nb),function(i){
+    neighbors <- nb[[i]]
+    if(length(neighbors)==1 && neighbors[1]==0) return(x[i])
+    0.50*x[i]+0.50*mean(x[neighbors])
+  },numeric(1))
+}
+
+## Join CDC AGS categories and compare correlations
+ags_spatial <- ags_val %>%
+  select(COUNTY_NAM,AGS_ord) %>%
+  left_join(st_drop_geometry(risk_sf) %>%
+              select(COUNTY_NAM,all_of(c(indices,paste0(indices,"_sp50")))),
+            by="COUNTY_NAM") %>%
+  filter(!is.na(AGS_ord))
+
+spatial_results <- bind_rows(lapply(indices,function(v){
+  original <- cor.test(ags_spatial[[v]],ags_spatial$AGS_ord,method="spearman",exact=FALSE)
+  smooth <- cor.test(ags_spatial[[paste0(v,"_sp50")]],ags_spatial$AGS_ord,
+                     method="spearman",exact=FALSE)
+
+  data.frame(
+    Index=v,
+    N=nrow(ags_spatial),
+    Original_rho=unname(original$estimate),
+    Spatial50_rho=unname(smooth$estimate),
+    Change_rho=unname(smooth$estimate-original$estimate),
+    Original_p=original$p.value,
+    Spatial50_p=smooth$p.value
+  )
+}))
+
+print(spatial_results)
+
+## Export comparison and county-level indices
+out_dir <- "C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Alpha Gal Risk in Illinois/Output"
+
+write.csv(spatial_results,file.path(out_dir,"CDC_AGS_spatial_50_50_correlation_comparison.csv"),row.names=FALSE)
+
+
+## Plot original vs spatially averaged AGS correlations
+library(dplyr); library(tidyr); library(ggplot2)
+
+plot_data <- spatial_results %>%
+  mutate(
+    Analysis=if_else(grepl("sensitivity$",Index),"Sensitivity","Primary"),
+    Model=if_else(grepl("^RF_",Index),"Random Forest","XGBoost"),
+    Analysis=factor(Analysis,levels=c("Primary","Sensitivity")),
+    Model=factor(Model,levels=c("Random Forest","XGBoost"))
+  )
+
+plot_long <- plot_data %>%
+  pivot_longer(c(Original_rho,Spatial50_rho),names_to="Version",values_to="Rho") %>%
+  mutate(Version=factor(Version,levels=c("Original_rho","Spatial50_rho"),
+                        labels=c("Original","Spatially averaged")))
+
+## Publication-quality comparison plot
+p_spatial <- ggplot(plot_long,aes(Model,Rho,fill=Version)) +
+  geom_col(position=position_dodge(width=0.75),width=0.65,color="white",linewidth=0.3) +
+  geom_text(aes(label=sprintf("%.3f",Rho)),
+            position=position_dodge(width=0.75),vjust=-0.5,
+            size=3.8,fontface="bold",color="#263238") +
+  geom_text(data=plot_data,
+            aes(x=Model,y=0.87,label=sprintf("\u0394\u03c1 = +%.3f",Change_rho)),
+            inherit.aes=FALSE,size=3.7,fontface="bold",color="#087F8C") +
+  facet_wrap(~Analysis,nrow=1) +
+  scale_fill_manual(values=c("Original"="#263B59",
+                             "Spatially averaged"="#087F8C")) +
+  scale_y_continuous(limits=c(0,0.94),breaks=seq(0,0.8,0.2),
+                     expand=expansion(mult=c(0,0))) +
+  labs(x=NULL,y="Spearman correlation (\u03c1)",
+       fill=NULL) +
+  theme_classic(base_size=13) +
+  theme(
+    axis.title.y=element_text(face="bold",margin=margin(r=10)),
+    axis.text=element_text(color="black"),
+    axis.text.x=element_text(face="bold"),
+    axis.line.y=element_blank(),
+    axis.ticks.y=element_blank(),
+    panel.grid.major.y=element_line(color="#E5E9EE",linewidth=0.35),
+    strip.text=element_text(face="bold",size=12),
+    strip.background=element_rect(fill="#F0F2F5",color="#D8DDE3"),
+    legend.position="top",
+    legend.text=element_text(face="bold"),
+    panel.spacing=unit(1.5,"lines")
+  )
+
+p_spatial
+
+## Export TIFF (300 dpi)
+out_dir <- "C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Alpha Gal Risk in Illinois/Output"
+
+ggsave(file.path(out_dir,"CDC_AGS_spatial_averaging_correlation_comparison.tiff"),
+       p_spatial,width=10,height=5.5,units="in",dpi=300,
+       compression="lzw",bg="white")
+```
+
+
+
+

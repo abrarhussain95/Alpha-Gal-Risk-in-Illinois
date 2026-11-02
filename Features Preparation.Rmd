@@ -1,0 +1,310 @@
+---
+title: "Features Preparation"
+author: "Abrar"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Climate  (BIO2 — Mean diurnal range BIO8 — Mean temperature of wettest quarter BIO9 — Mean temperature of driest quarter BIO15 — Precipitation seasonality BIO18 — Precipitation of warmest quarter)
+```{r}
+library(sf); library(terra); library(dplyr); library(predicts)
+
+## Paths and Illinois counties
+root <- "C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Alpha Gal Risk in Illinois"
+
+il_sf <- st_read("C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Bayesian Spatial Modeling (Illinois)/Illinois Shape File/Shape file of interest/IL_BNDY_County_Py.shp", quiet=TRUE) %>%
+  select(COUNTY_NAM) %>% st_make_valid() %>% st_transform(4326)
+
+il_v <- vect(il_sf)
+
+## Download/cache climate
+base_url <- "https://geodata.ucdavis.edu/climate/worldclim/2_1/hist/cts4.09"
+cache <- file.path(root, "Data/Climate_CRU_TS_4.09")
+dir.create(cache, recursive=TRUE, showWarnings=FALSE)
+options(timeout=3600)
+
+get_year <- function(variable, year) {
+  stem <- paste0("wc2.1_cruts4.09_2.5m_", variable, "_2020-2024")
+  folder <- file.path(cache, stem)
+  zipfile <- file.path(cache, paste0(stem, ".zip"))
+
+  tif <- if(dir.exists(folder)) list.files(folder, "\\.tif$", recursive=TRUE, full.names=TRUE) else character()
+
+  if(length(tif) != 60) {
+    if(!file.exists(zipfile))
+      download.file(paste0(base_url,"/",basename(zipfile)), zipfile, mode="wb")
+
+    dir.create(folder, recursive=TRUE, showWarnings=FALSE)
+    unzip(zipfile, exdir=folder)
+    tif <- list.files(folder, "\\.tif$", recursive=TRUE, full.names=TRUE)
+  }
+
+  f <- tif[grepl(paste0(year,"[-_.](0?[1-9]|1[0-2])\\.tif$"), basename(tif))]
+  m <- as.integer(sub(paste0(".*",year,"[-_.]([0-9]{1,2})\\.tif$"), "\\1", basename(f)))
+
+  x <- rast(f[order(m)])
+  mask(crop(x, il_v), il_v)
+}
+
+## Progress bar: 12 steps total
+# 3 years × 4 main steps
+pb <- txtProgressBar(min=0, max=12, style=3)
+step <- 0
+
+progress <- function(msg) {
+  step <<- step + 1
+  setTxtProgressBar(pb, step)
+  cat(sprintf("\n%.1f%% completed | %s\n", 100*step/12, msg))
+}
+
+## Calculate BIO variables
+bio_annual <- lapply(2022:2024, function(y) {
+
+  cat("\nProcessing year:", y, "\n")
+
+  prec <- get_year("prec", y)
+  progress(paste(y, "precipitation loaded"))
+
+  tmin <- get_year("tmin", y)
+  progress(paste(y, "minimum temperature loaded"))
+
+  tmax <- get_year("tmax", y)
+  progress(paste(y, "maximum temperature loaded"))
+
+  bio <- predicts::bcvars(prec=prec, tmin=tmin, tmax=tmax)
+
+  x <- bio[[c(2,8,9,15,18)]]
+  names(x) <- c("BIO2","BIO8","BIO9","BIO15","BIO18")
+
+  z <- terra::extract(x, il_v, fun=mean, na.rm=TRUE)
+
+  progress(paste(y, "county extraction completed"))
+
+  data.frame(COUNTY_NAM=il_sf$COUNTY_NAM, Year=y, z[,-1])
+}) %>% bind_rows()
+
+close(pb)
+cat("\nClimate extraction completed: 100%\n")
+
+## Average 2022–2024
+climate <- bio_annual %>%
+  group_by(COUNTY_NAM) %>%
+  summarise(across(c(BIO2,BIO8,BIO9,BIO15,BIO18), ~mean(.x, na.rm=TRUE)), .groups="drop") %>%
+  arrange(COUNTY_NAM)
+
+stopifnot(nrow(climate)==102, !anyNA(climate))
+
+print(climate, n=102)
+summary(climate)
+
+## Save
+out_dir <- "C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Alpha Gal Risk in Illinois/Data/Faetures"
+dir.create(out_dir, recursive=TRUE, showWarnings=FALSE)
+
+write.csv(
+  climate,
+  file.path(out_dir, "climate_BIO_2022_2024.csv"),
+  row.names=FALSE
+)
+
+cat("\nSaved:", file.path(out_dir, "climate_BIO_2022_2024.csv"), "\n")
+
+```
+
+
+## Landscape (forest %, wetland %, forest edge density)
+```{r}
+library(sf); library(terra); library(dplyr)
+library(exactextractr); library(landscapemetrics); library(raster); library(curl)
+
+## Paths
+root <- "C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Alpha Gal Risk in Illinois"
+shp_path <- "C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Bayesian Spatial Modeling (Illinois)/Illinois Shape File/Shape file of interest/IL_BNDY_County_Py.shp"
+
+il_sf <- sf::st_read(shp_path, quiet=TRUE) %>% dplyr::select(COUNTY_NAM) %>% sf::st_make_valid()
+stopifnot(nrow(il_sf)==102)
+
+years <- 2022:2024
+cache <- file.path(root,"Data/Annual_NLCD")
+dir.create(cache, recursive=TRUE, showWarnings=FALSE)
+
+## Progress
+total_steps <- length(years)*105
+pb <- txtProgressBar(min=0,max=total_steps,style=3); step <- 0
+progress <- function(msg=NULL) {
+  step <<- step+1; setTxtProgressBar(pb,step)
+  if(!is.null(msg)) cat(sprintf("\n%.1f%% completed | %s\n",100*step/total_steps,msg))
+}
+
+## Download/load Annual NLCD
+get_nlcd <- function(y) {
+  stem <- paste0("Annual_NLCD_LndCov_",y,"_CU_C1V1")
+  zipfile <- file.path(cache,paste0(stem,".zip"))
+  tiffile <- file.path(cache,paste0(stem,".tif"))
+  url <- paste0("https://www.mrlc.gov/downloads/sciweb1/shared/mrlc/data-bundles/",stem,".zip")
+
+  if(!file.exists(tiffile)) {
+    if(!file.exists(zipfile)) {
+      cat("\nDownloading NLCD",y,"...\n")
+      curl::curl_download(url,zipfile,quiet=FALSE)
+    }
+    cat("\nExtracting NLCD",y,"...\n")
+    unzip(zipfile,files=paste0(stem,".tif"),exdir=cache)
+  }
+
+  terra::rast(tiffile)
+}
+
+## Extract 2022–2024
+land_annual <- lapply(years,function(y) {
+
+  cat("\nProcessing Annual NLCD",y,"\n")
+  nlcd <- get_nlcd(y)
+  progress(paste(y,"NLCD loaded"))
+
+  il_y <- sf::st_transform(il_sf,terra::crs(nlcd))
+  nlcd_r <- raster::raster(nlcd)
+
+  pct <- function(codes) exactextractr::exact_extract(
+    nlcd_r,il_y,function(values,frac) {
+      ok <- !is.na(values)
+      100*sum(frac[ok & values %in% codes],na.rm=TRUE)/sum(frac[ok],na.rm=TRUE)
+    },progress=FALSE)
+
+  forest_pct <- pct(c(41,42,43))
+  progress(paste(y,"forest cover extracted"))
+
+  wetland_pct <- pct(c(90,95))
+  progress(paste(y,"wetland cover extracted"))
+
+  edge <- sapply(seq_len(nrow(il_y)),function(i) {
+    county <- terra::vect(il_y[i,])
+    r <- terra::mask(terra::crop(nlcd,county),county)
+    forest <- r %in% c(41,42,43)
+
+    m <- landscapemetrics::calculate_lsm(
+      forest,what="lsm_c_ed",directions=8,verbose=FALSE
+    ) %>% dplyr::filter(class==1)
+
+    progress(if(i%%10==0 || i==102) paste(y,"edge density:",i,"/ 102 counties") else NULL)
+    if(nrow(m)==0) NA_real_ else m$value[1]
+  })
+
+  data.frame(COUNTY_NAM=il_y$COUNTY_NAM,Year=y,
+             Forest_pct=forest_pct,Wetland_pct=wetland_pct,
+             Forest_edge_density=edge)
+}) %>% dplyr::bind_rows()
+
+close(pb)
+cat("\n100% completed | Landscape extraction finished\n")
+
+## Average 2022–2024
+landscape <- land_annual %>%
+  group_by(COUNTY_NAM) %>%
+  summarise(across(c(Forest_pct,Wetland_pct,Forest_edge_density),
+                   ~mean(.x,na.rm=TRUE)),.groups="drop") %>%
+  arrange(COUNTY_NAM)
+
+stopifnot(nrow(landscape)==102,!anyNA(landscape))
+print(landscape,n=102)
+summary(landscape)
+
+## Save
+out_dir <- "C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Alpha Gal Risk in Illinois/Data/Faetures"
+dir.create(out_dir,recursive=TRUE,showWarnings=FALSE)
+
+write.csv(landscape,file.path(out_dir,"landscape_2022_2024.csv"),row.names=FALSE)
+cat("\nSaved:",file.path(out_dir,"landscape_2022_2024.csv"),"\n")
+```
+
+
+
+## Deer habiate suitability index
+```{r}
+library(sf); library(terra); library(dplyr); library(exactextractr)
+
+## Paths and Illinois counties
+root <- "C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Alpha Gal Risk in Illinois"
+
+shp_path <- "C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Bayesian Spatial Modeling (Illinois)/Illinois Shape File/Shape file of interest/IL_BNDY_County_Py.shp"
+
+deer_path <- "C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Tick Passive Survillance/Data/Deer Habitate Data (Illinois)/Deer Habitat Rasters/Deer_Habitat_2022.tif"
+
+il_sf <- sf::st_read(shp_path, quiet=TRUE) %>% dplyr::select(COUNTY_NAM) %>% sf::st_make_valid()
+deer_r <- terra::rast(deer_path)
+il_deer <- sf::st_transform(il_sf, terra::crs(deer_r))
+
+## Check raster scale
+cat("25% completed | Raster loaded\n")
+print(terra::global(deer_r, c("min","max"), na.rm=TRUE))
+
+## Extract county mean deer habitat suitability
+cat("50% completed | Extracting county means\n")
+
+Deer_suitability <- exactextractr::exact_extract(
+  deer_r, il_deer, "mean", progress=TRUE
+)
+
+deer <- data.frame(
+  COUNTY_NAM=il_deer$COUNTY_NAM,
+  Deer_suitability=Deer_suitability
+) %>% arrange(COUNTY_NAM)
+
+cat("75% completed | Checking output\n")
+
+stopifnot(nrow(deer)==102, !anyDuplicated(deer$COUNTY_NAM), !anyNA(deer$Deer_suitability))
+print(deer, n=102)
+summary(deer$Deer_suitability)
+
+## Save
+out_dir <- "C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Alpha Gal Risk in Illinois/Data/Faetures"
+dir.create(out_dir, recursive=TRUE, showWarnings=FALSE)
+
+write.csv(deer, file.path(out_dir,"deer_habitat_2022.csv"), row.names=FALSE)
+
+cat("100% completed | Saved deer_habitat_2022.csv\n")
+```
+
+
+
+##Combine all feature
+```{r}
+library(dplyr)
+
+## Load feature files
+feat_dir <- "C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Alpha Gal Risk in Illinois/Data/Faetures"
+
+climate <- read.csv(file.path(feat_dir, "climate_BIO_2022_2024.csv"))
+landscape <- read.csv(file.path(feat_dir, "landscape_2022_2024.csv"))
+deer <- read.csv(file.path(feat_dir, "deer_habitat_2022.csv"))
+
+## Combine all features
+features <- climate %>%
+  left_join(landscape, by="COUNTY_NAM") %>%
+  left_join(deer, by="COUNTY_NAM") %>%
+  arrange(COUNTY_NAM)
+
+## Checks
+stopifnot(nrow(features)==102, !anyDuplicated(features$COUNTY_NAM))
+cat("Counties:", nrow(features), "\n")
+cat("Missing values:", sum(is.na(features)), "\n")
+
+print(features, n=102)
+summary(features)
+
+## Save
+feat_dir <- "C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Alpha Gal Risk in Illinois/Data/Faetures"
+
+write.csv(
+  features,
+  file.path(feat_dir, "ALL FEATURES COMBINED.csv"),
+  row.names=FALSE
+)
+
+cat("\nSaved:", file.path(feat_dir, "ALL FEATURES COMBINED.csv"), "\n")
+
+```

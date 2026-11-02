@@ -1,0 +1,129 @@
+---
+title: "Data curation and visualization"
+author: "Abrar"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## tick outcome and descriptiev stat
+```{r}
+library(dplyr)
+
+## Load data
+data_dir <- "C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Alpha Gal Risk in Illinois/Data"
+
+dat <- read.csv(file.path(data_dir, "LS_data.csv"))
+
+## Create proportional outcome
+dat <- dat %>%
+  mutate(LS_prop = ifelse(Total_tick > 0, LS_tick / Total_tick, NA_real_))
+
+## Descriptive statistics function
+get_desc <- function(x, name) {
+  x_valid <- x[!is.na(x)]
+  sw <- shapiro.test(x_valid)
+
+  data.frame(
+    Variable = name,
+    Total_counties = length(x),
+    Valid_counties = length(x_valid),
+    Missing_counties = sum(is.na(x)),
+    Mean = mean(x_valid),
+    SD = sd(x_valid),
+    Median = median(x_valid),
+    Q1 = quantile(x_valid, 0.25),
+    Q3 = quantile(x_valid, 0.75),
+    IQR = IQR(x_valid),
+    Minimum = min(x_valid),
+    Maximum = max(x_valid),
+    Zero_counties = sum(x_valid == 0),
+    Shapiro_W = unname(sw$statistic),
+    Shapiro_p = sw$p.value
+  )
+}
+
+## Raw count and proportional outcome
+desc <- bind_rows(
+  get_desc(dat$LS_tick, "Lone star tick count"),
+  get_desc(dat$LS_prop, "Lone star tick proportion")
+)
+
+print(desc)
+
+## Save output
+out_dir <- "C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Alpha Gal Risk in Illinois/Output"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+write.csv(
+  desc,
+  file.path(out_dir, "descriptive_lone_star_outcomes.csv"),
+  row.names = FALSE
+)
+
+```
+
+
+##Mapping outcoem
+```{r}
+library(sf); library(dplyr); library(ggplot2); library(viridis); library(scales)
+
+## Load data and shapefile
+data_dir <- "C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Alpha Gal Risk in Illinois/Data"
+dat <- read.csv(file.path(data_dir, "LS_data.csv")) %>% mutate(LS_prop = ifelse(Total_tick > 0, LS_tick / Total_tick, NA_real_))
+
+shp <- st_read("C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Bayesian Spatial Modeling (Illinois)/Illinois Shape File/Shape file of interest/IL_BNDY_County_Py.shp", quiet=TRUE)
+
+## Merge
+dat <- dat %>% mutate(county_key=tolower(gsub("[[:space:]]+","",trimws(COUNTY))))
+shp <- shp %>% mutate(county_key=tolower(gsub("[[:space:]]+","",trimws(COUNTY_NAM))))
+map <- left_join(shp, dat, by="county_key")
+
+## Map lone star tick proportion
+## Illinois outer boundary
+il_boundary <- sf::st_union(map)
+
+fig <- ggplot(map) +
+  geom_sf(aes(fill = LS_prop), color = "grey45", linewidth = 0.18) +
+  scale_fill_gradientn(
+    colors = c("white", viridis::plasma(100)),
+    limits = c(0, 1),
+    breaks = c(0, 0.25, 0.50, 0.75, 1),
+    na.value = "grey85",
+    name = "Proportion"
+  ) +
+  coord_sf(datum = NA, expand = TRUE) +
+  theme_void(base_size = 14) +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(face = "bold", size = 12),
+    legend.text = element_text(size = 10, color = "black"),
+    plot.margin = margin(12, 12, 12, 12)
+  )
+
+fig
+
+## Save
+out_dir <- "C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Alpha Gal Risk in Illinois/Output"
+ggsave(file.path(out_dir, "lone_star_tick_proportion_map.tiff"), fig,
+       width=6, height=8, dpi=300, compression="lzw", bg="white")
+```
+
+
+## Export file for later use
+```{r}
+## Save complete spatial outcome dataset
+data_dir <- "C:/Users/abrar/OneDrive - University of Illinois - Urbana/Documents/Abrar Hussain/Ph.D/Ph.D. Papers/As Authors/Alpha Gal Risk in Illinois/Data"
+
+saveRDS(
+  map,
+  file.path(data_dir, "LS_outcome_all_data_sf.rds")
+)
+
+cat("Saved complete spatial dataset with", nrow(map), "counties and",
+    ncol(map), "columns.\n")
+```
